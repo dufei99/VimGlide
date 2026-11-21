@@ -136,7 +136,7 @@ impl Tray {
     /// 处理托盘图标上的鼠标消息。
     pub fn on_mouse(&mut self, lparam: LPARAM) -> TrayAction {
         match lparam.0 as u32 {
-            WM_LBUTTONUP => TrayAction::Toggle,
+            WM_LBUTTONUP => TrayAction::Help,
             WM_RBUTTONUP => self.show_menu(),
             _ => TrayAction::None,
         }
@@ -262,7 +262,7 @@ impl Tray {
              Esc                 退出提示模式\n\
              方向键 / PageUp/Down / Home/End   滚动\n\
              j k h l d u g G     滚动（缓冲区为空且无匹配标签时生效）\n\
-             托盘左键            显示提示\n\
+             托盘左键            打开帮助\n\
              托盘右键            这个菜单\n\n\
              热键被占用时会自动退到 ctrl+alt+space 或 alt+shift+space。\n\
              配置文件：{1}\n\

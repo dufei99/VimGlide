@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationTreeWalker,
@@ -12,8 +13,6 @@ use windows::Win32::UI::Accessibility::{
     UIA_SliderControlTypeId, UIA_SplitButtonControlTypeId, UIA_TabItemControlTypeId,
     UIA_TreeItemControlTypeId,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-
 use crate::model::{Rect, Target};
 
 const MAX_TARGETS: usize = 800;
@@ -35,14 +34,13 @@ impl UiaSource {
     /// 遍历前台窗口的无障碍树，返回可点击元素。
     ///
     /// `budget` 用于限制总耗时，避免在复杂应用上卡住遮罩层。
-    pub fn collect(&self, screen: Rect, budget: Duration) -> Vec<Target> {
+    pub fn collect(&self, screen: Rect, budget: Duration, hwnd: HWND) -> Vec<Target> {
         let deadline = Instant::now() + budget;
         let mut targets = Vec::new();
         let mut seen: HashSet<(i32, i32, i32, i32)> = HashSet::new();
 
         // SAFETY: 本方法在拥有 COM 初始化的线程内调用，UIA 对象只在本次调用中使用。
         unsafe {
-            let hwnd = GetForegroundWindow();
             let root = if hwnd.0.is_null() {
                 self.automation.GetRootElement()
             } else {

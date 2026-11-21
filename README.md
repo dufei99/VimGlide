@@ -16,7 +16,7 @@
 - **助记式标签**：优先用元素名称首字母做单字符助记标签（如 `Save` → `s`），冲突时退化为双字符标签，不会出现「一个标签是另一个标签前缀」的歧义。
 - **输入即筛选**：已输入前缀高亮，未匹配的标签自动隐藏，HUD 实时显示剩余数量。
 - **Vim 风格滚动**：提示模式下可直接用 `j k h l d u g G`、方向键、PageUp/PageDown、Home/End 滚动页面。
-- **托盘常驻**：左键唤出提示，右键打开菜单（打开配置、帮助、以管理员身份重启、退出）。
+- **托盘常驻**：左键打开帮助，右键打开菜单（显示提示、打开配置、帮助、以管理员身份重启、退出）。
 - **热键被占用时自动退让**：默认热键注册失败会依次尝试 `ctrl+alt+space`、`alt+shift+space`。
 - **完全可配置**：热键、标签字符表、配色、字号、滚动步长都写在 TOML 里。
 
@@ -49,7 +49,7 @@ cargo build --release
 
 ## 使用
 
-按 **`Ctrl+Shift+Space`**（或托盘左键）唤出提示，然后：
+按 **`Ctrl+Shift+Space`** 唤出提示，然后：
 
 | 按键 | 作用 |
 | --- | --- |
@@ -147,6 +147,7 @@ src/
 
 - 只识别支持 UI Automation 的控件；自绘界面或缺少无障碍信息的程序可能采不到元素。Chromium/Electron 类应用（如 Trae CN）默认不生成无障碍树，需要加 `--force-renderer-accessibility` 启动，详见[上文](#vs-code--electron-类应用如-trae-cn)。
 - 提示模式会拦截所有键盘输入（包括输入法），`Esc` 可随时退出。
+- GTK 类程序（Inkscape、GIMP 等）在 Windows 上无法识别：GTK 只暴露一个 `gdkWindowToplevel` 顶层窗口，既不实现 UI Automation 也没有 MSAA 桥接，实测其无障碍子树为空，因此没有可标注的元素；GTK 在 Windows 上没有类似 `--force-renderer-accessibility` 的开关，属于上游限制。
 - Windows 平台独占，尚未实现 Linux / macOS 后端。
 
 ## 测试

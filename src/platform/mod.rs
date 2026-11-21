@@ -53,6 +53,9 @@ pub trait Backend {
     /// 采集当前前台窗口里可点击的元素。
     fn collect_targets(&mut self) -> Vec<Target>;
 
+    /// 进入提示模式之前的准备：记录要采集的前台窗口等。
+    fn begin_hints(&mut self) {}
+
     /// 在屏幕坐标处模拟一次左键单击。
     fn click(&mut self, x: i32, y: i32);
 

@@ -10,11 +10,13 @@ use windows::Win32::Graphics::Gdi::{
     DeleteDC, DeleteObject, HBITMAP, HDC, HGDIOBJ, SelectObject,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, HWND_TOPMOST, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DestroyWindow, GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW,
+    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, RegisterClassExW, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::model::Rect;
@@ -31,9 +33,39 @@ pub struct Overlay {
     height: i32,
     origin: (i32, i32),
     visible: bool,
+    /// 是否为了让遮罩压住任务栏而临时抢占了前台。
+    activated: bool,
+    /// 下一次显示时是否允许抢占前台（仅提示模式，启动提示不抢）。
+    activate_pending: bool,
+    /// 抢占前的前台窗口，退出提示模式时恢复。
+    restore: HWND,
 }
 
 impl Overlay {
+    /// 临时抢占前台，使遮罩成为前台进程的置顶窗口。
+    ///
+    /// # Safety
+    /// `self.hwnd` 必须是有效的遮罩窗口。
+    unsafe fn take_foreground(&mut self, foreground: HWND) {
+        // SAFETY: 句柄由本结构持有。
+        unsafe {
+            let style = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            // WS_EX_NOACTIVATE 的窗口无法成为前台，先临时去掉。
+            let _ = SetWindowLongPtrW(
+                self.hwnd,
+                GWL_EXSTYLE,
+                style & !(WS_EX_NOACTIVATE.0 as isize),
+            );
+            force_foreground(self.hwnd);
+            if GetForegroundWindow() == self.hwnd {
+                self.activated = true;
+                self.restore = foreground;
+            } else {
+                let _ = SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, style);
+            }
+        }
+    }
+
     pub fn new(screen: Rect) -> Result<Self, String> {
         unsafe {
             let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
@@ -83,6 +115,9 @@ impl Overlay {
                 height: screen.h,
                 origin: (screen.x, screen.y),
                 visible: false,
+                activated: false,
+                activate_pending: false,
+                restore: HWND::default(),
             };
             overlay.create_surface(screen.w, screen.h)?;
             Ok(overlay)
@@ -91,6 +126,11 @@ impl Overlay {
 
     pub fn hwnd(&self) -> HWND {
         self.hwnd
+    }
+
+    /// 请求下一次显示时抢占前台（用于压住任务栏等置顶窗口）。
+    pub fn request_activation(&mut self) {
+        self.activate_pending = true;
     }
 
     /// 遮罩层所在显示器的缩放系数。
@@ -189,6 +229,18 @@ impl Overlay {
 
             if !self.visible {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                // 任务栏本身也是置顶窗口，当前台窗口是任务栏时，它会被排到置顶层最前面，
+                // 而 ShowWindow 只会按窗口原有的 Z 序显示，遮罩就会被任务栏压住。
+                // 先取消置顶再重新置顶，才能把窗口插到置顶层的最前面。
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_NOTOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
                 let _ = SetWindowPos(
                     self.hwnd,
                     Some(HWND_TOPMOST),
@@ -198,6 +250,15 @@ impl Overlay {
                     0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                 );
+                // 任务栏若是前台窗口，它作为「前台进程的置顶窗口」始终压在其他置顶窗口之上，
+                // 仅调整 Z 序无法盖住它；此时临时抢占前台，让遮罩成为前台置顶窗口。
+                if self.activate_pending {
+                    self.activate_pending = false;
+                    let foreground = GetForegroundWindow();
+                    if !foreground.0.is_null() && foreground != self.hwnd && is_topmost(foreground) {
+                        self.take_foreground(foreground);
+                    }
+                }
                 self.visible = true;
             }
         }
@@ -205,10 +266,26 @@ impl Overlay {
     }
 
     pub fn hide(&mut self) {
+        self.activate_pending = false;
         if self.visible {
             // SAFETY: hwnd 有效。
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
+                if self.activated {
+                    // 恢复「不激活」样式，再把前台还给原来的窗口。
+                    let style = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+                    let _ = SetWindowLongPtrW(
+                        self.hwnd,
+                        GWL_EXSTYLE,
+                        style | WS_EX_NOACTIVATE.0 as isize,
+                    );
+                    self.activated = false;
+                    let restore = self.restore;
+                    self.restore = HWND::default();
+                    if !restore.0.is_null() {
+                        force_foreground(restore);
+                    }
+                }
             }
             self.visible = false;
         }
@@ -221,6 +298,46 @@ impl Overlay {
             self.dib = HBITMAP::default();
             self.bits = ptr::null_mut();
         }
+    }
+}
+
+/// 窗口是否带 `WS_EX_TOPMOST`。
+///
+/// # Safety
+/// `hwnd` 必须是有效窗口句柄。
+unsafe fn is_topmost(hwnd: HWND) -> bool {
+    // SAFETY: 纯查询调用。
+    unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST.0 as isize != 0 }
+}
+
+/// 把窗口设为前台。
+///
+/// 后台进程直接调用 `SetForegroundWindow` 通常会被系统拒绝，
+/// 这里先临时附加到当前前台线程的输入队列，成功后再解除附加。
+///
+/// # Safety
+/// `hwnd` 必须是有效窗口句柄。
+unsafe fn force_foreground(hwnd: HWND) {
+    // SAFETY: 所有调用都是标准的 Win32 前台切换流程。
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground == hwnd {
+            return;
+        }
+        let foreground_thread = if foreground.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, None)
+        };
+        let current_thread = GetCurrentThreadId();
+        if foreground_thread != 0 && foreground_thread != current_thread {
+            if AttachThreadInput(current_thread, foreground_thread, true).as_bool() {
+                let _ = SetForegroundWindow(hwnd);
+                let _ = AttachThreadInput(current_thread, foreground_thread, false);
+                return;
+            }
+        }
+        let _ = SetForegroundWindow(hwnd);
     }
 }
 

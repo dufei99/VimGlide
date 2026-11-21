@@ -73,6 +73,18 @@ pub fn click(x: i32, y: i32) {
     send(&[mouse_input(0, 0, 0, MOUSEEVENTF_LEFTUP)]);
 }
 
+/// 双击（桌面图标、文件列表等需要双击才会打开）。
+pub fn double_click(x: i32, y: i32) {
+    move_to(x, y);
+    sleep(Duration::from_millis(10));
+    for _ in 0..2 {
+        send(&[mouse_input(0, 0, 0, MOUSEEVENTF_LEFTDOWN)]);
+        sleep(Duration::from_millis(10));
+        send(&[mouse_input(0, 0, 0, MOUSEEVENTF_LEFTUP)]);
+        sleep(Duration::from_millis(40));
+    }
+}
+
 /// 滚轮：vertical 为垂直刻度（正=向下），horizontal 为水平刻度（正=向右）。
 pub fn wheel(vertical: i32, horizontal: i32) {
     if vertical != 0 {

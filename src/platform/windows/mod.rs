@@ -19,8 +19,8 @@ use windows::Win32::Foundation::{
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcess, OpenProcess, OpenProcessToken,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateMutexW, GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    SetProcessWorkingSetSize,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -32,8 +32,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DefWindowProcW, DispatchMessageW, GetForegroundWindow, GetMessageW,
-    GetSystemMetrics, GetWindowThreadProcessId, KBDLLHOOKSTRUCT, KillTimer, MSG,
+    CallNextHookEx, DefWindowProcW, DispatchMessageW, GetClassNameW, GetForegroundWindow,
+    GetMessageW, GetSystemMetrics, GetWindowThreadProcessId, KBDLLHOOKSTRUCT, KillTimer, MSG,
     MB_ICONINFORMATION, MB_OK, MessageBoxW, PostMessageW, PostQuitMessage, SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetTimer, SetWindowsHookExW,
     TIMERPROC, TranslateMessage, WH_KEYBOARD_LL, WM_APP, WM_HOTKEY, WM_KEYDOWN, WM_SYSKEYDOWN,
@@ -125,6 +125,10 @@ pub struct WindowsBackend {
     elevated: bool,
     /// 上一次采集是否因为前台窗口权限更高而失败。
     needs_admin: bool,
+    /// 提示模式开始时的前台窗口；遮罩可能抢走前台，采集必须仍以它为准。
+    scan_root: HWND,
+    /// 最近一次属于其他程序的前台窗口，用于遮罩自己成为前台时兜底。
+    last_external: HWND,
     uia: Option<UiaSource>,
     uia_unavailable: bool,
 }
@@ -207,6 +211,8 @@ impl WindowsBackend {
             hint_hotkey,
             elevated,
             needs_admin: false,
+            scan_root: HWND::default(),
+            last_external: HWND::default(),
             uia: None,
             uia_unavailable: false,
         })
@@ -246,8 +252,23 @@ impl Backend for WindowsBackend {
         &self.desktop
     }
 
+    fn begin_hints(&mut self) {
+        // SAFETY: 纯查询调用。
+        let foreground = unsafe { GetForegroundWindow() };
+        let root = if foreground == self.overlay.hwnd() {
+            self.last_external
+        } else {
+            foreground
+        };
+        self.scan_root = root;
+        if !root.0.is_null() {
+            self.last_external = root;
+        }
+        self.overlay.request_activation();
+    }
+
     fn collect_targets(&mut self) -> Vec<Target> {
-        let elevated_target = foreground_pid()
+        let elevated_target = window_pid(self.scan_root)
             .map(process_is_elevated)
             .unwrap_or(false);
         if self.uia.is_none() && !self.uia_unavailable {
@@ -260,7 +281,11 @@ impl Backend for WindowsBackend {
             }
         }
         let targets = match &self.uia {
-            Some(source) => source.collect(self.desktop.screen, Duration::from_millis(1500)),
+            Some(source) => source.collect(
+                self.desktop.screen,
+                Duration::from_millis(1500),
+                self.scan_root,
+            ),
             None => Vec::new(),
         };
         self.needs_admin = targets.is_empty() && elevated_target && !self.elevated;
@@ -268,7 +293,12 @@ impl Backend for WindowsBackend {
     }
 
     fn click(&mut self, x: i32, y: i32) {
-        input::click(x, y);
+        // 桌面图标需要双击才会执行；普通窗口的按钮单击即可。
+        if is_desktop_window(self.scan_root) {
+            input::double_click(x, y);
+        } else {
+            input::click(x, y);
+        }
     }
 
     fn scroll(&mut self, vertical: i32, horizontal: i32) {
@@ -283,6 +313,12 @@ impl Backend for WindowsBackend {
 
     fn hide(&mut self) {
         self.overlay.hide();
+        // 空闲时释放 UIA 对象并把工作集还给系统，降低常驻内存。
+        self.uia = None;
+        // SAFETY: 仅作用于当前进程。
+        unsafe {
+            let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+        }
     }
 
     fn set_key_capture(&mut self, enabled: bool) {
@@ -618,11 +654,10 @@ fn process_is_elevated(pid: u32) -> bool {
     }
 }
 
-/// 前台窗口所属进程的 PID。
-fn foreground_pid() -> Option<u32> {
+/// 窗口所属进程的 PID。
+fn window_pid(hwnd: HWND) -> Option<u32> {
     // SAFETY: 纯查询调用。
     unsafe {
-        let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
             return None;
         }
@@ -630,6 +665,18 @@ fn foreground_pid() -> Option<u32> {
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
         (pid != 0).then_some(pid)
     }
+}
+
+/// 窗口是否属于桌面（桌面图标需要双击才能打开）。
+fn is_desktop_window(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+    let mut buffer = [0u16; 64];
+    // SAFETY: 传入的缓冲区长度与切片长度一致。
+    let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
+    let class = String::from_utf16_lossy(&buffer[..len.max(0) as usize]);
+    matches!(class.as_str(), "Progman" | "WorkerW" | "SHELLDLL_DefView")
 }
 
 /// 只允许运行一个实例，避免出现两个托盘图标互相抢热键。

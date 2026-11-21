@@ -20,7 +20,8 @@ struct Notice {
 pub struct App {
     config: Config,
     canvas: Canvas,
-    text: TextRenderer,
+    /// 字体渲染器按需创建：仅在遮罩可见时持有，隐藏后释放。
+    text: Option<TextRenderer>,
     hints: Option<HintSet>,
     notice: Option<Notice>,
     visible: bool,
@@ -30,15 +31,10 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config, desktop: &Desktop) -> Result<Self, String> {
-        let text = TextRenderer::new(desktop.font.clone())
-            .ok_or_else(|| "无法解析系统字体用于绘制提示".to_string())?;
         Ok(Self {
-            canvas: Canvas::new(
-                desktop.screen.w.max(1) as u32,
-                desktop.screen.h.max(1) as u32,
-            ),
+            canvas: Canvas::new(0, 0),
             config,
-            text,
+            text: None,
             hints: None,
             notice: None,
             visible: false,
@@ -74,13 +70,16 @@ impl App {
         self.notice = None;
         backend.set_key_capture(false);
         backend.hide();
-        // 释放整屏画布（约 8MB/1080p），下次显示时再分配。
+        // 释放整屏画布（约 8MB/1080p）与字体数据，下次显示时再分配。
         self.canvas.release();
+        self.text = None;
     }
 
     fn activate(&mut self, backend: &mut dyn Backend) {
         self.visible = true;
         self.hints = None;
+        // 先记录前台窗口：遮罩显示时可能为了盖住任务栏而抢占前台。
+        backend.begin_hints();
         self.notice = Some(Notice {
             text: "VimGlide: scanning clickable elements ...".to_string(),
             until: Instant::now() + Duration::from_secs(10),
@@ -245,10 +244,16 @@ impl App {
         self.canvas
             .ensure_size(screen.w.max(1) as u32, screen.h.max(1) as u32);
         self.canvas.clear();
+        if self.text.is_none() {
+            self.text = TextRenderer::new(backend.desktop().font.clone());
+        }
+        let Some(text) = self.text.as_ref() else {
+            return;
+        };
         if let Some(hints) = &self.hints {
             Self::paint_hints(
                 &mut self.canvas,
-                &self.text,
+                text,
                 &self.config,
                 hints,
                 scale,
@@ -257,7 +262,7 @@ impl App {
         }
         Self::paint_hud(
             &mut self.canvas,
-            &self.text,
+            text,
             &self.config,
             scale,
             self.hints.as_ref(),
