@@ -13,8 +13,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
-    ShellExecuteW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    Shell_NotifyIconW, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DestroyIcon, DestroyMenu,
@@ -42,6 +42,7 @@ const CMD_CONFIG: usize = 2;
 const CMD_HELP: usize = 3;
 const CMD_QUIT: usize = 4;
 const CMD_ELEVATE: usize = 5;
+const CMD_RELOAD: usize = 6;
 
 /// 托盘交互产生的动作，由消息循环执行。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +50,7 @@ pub enum TrayAction {
     None,
     Toggle,
     OpenConfig,
+    Reload,
     Help,
     Elevate,
     Quit,
@@ -142,9 +144,20 @@ impl Tray {
         }
     }
 
-    fn show_menu(&mut self) -> TrayAction {
-        let toggle = wide(&format!("显示提示 ({})", self.hint_hotkey));
+    /// 配置重新载入后刷新悬停提示与菜单里的热键文字。
+    pub fn update_hotkeys(&mut self, hint_hotkey: &str, quit_hotkey: &str) {
+        self.hint_hotkey = hint_hotkey.to_string();
+        self.quit_hotkey = quit_hotkey.to_string();
+        let data = self.notify_data();
+        // SAFETY: 结构体大小与句柄均有效。
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+        }
+    }
+
+    fn show_menu(&mut self) -> TrayAction {        let toggle = wide(&format!("显示提示 ({})", self.hint_hotkey));
         let open = wide("打开配置文件");
+        let reload = wide("重新载入配置");
         let help = wide("帮助");
         let elevate = wide("以管理员身份重启");
         let quit = wide(&format!("退出 VimGlide ({})", self.quit_hotkey));
@@ -157,6 +170,7 @@ impl Tray {
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE, PCWSTR(toggle.as_ptr()));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, CMD_CONFIG, PCWSTR(open.as_ptr()));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_RELOAD, PCWSTR(reload.as_ptr()));
             let _ = AppendMenuW(menu, MF_STRING, CMD_HELP, PCWSTR(help.as_ptr()));
             if !self.elevated {
                 let _ = AppendMenuW(menu, MF_STRING, CMD_ELEVATE, PCWSTR(elevate.as_ptr()));
@@ -183,6 +197,7 @@ impl Tray {
             match command.0 as usize {
                 CMD_TOGGLE => TrayAction::Toggle,
                 CMD_CONFIG => TrayAction::OpenConfig,
+                CMD_RELOAD => TrayAction::Reload,
                 CMD_HELP => TrayAction::Help,
                 CMD_ELEVATE => TrayAction::Elevate,
                 CMD_QUIT => TrayAction::Quit,
@@ -266,7 +281,7 @@ impl Tray {
              托盘右键            这个菜单\n\n\
              热键被占用时会自动退到 ctrl+alt+space 或 alt+shift+space。\n\
              配置文件：{1}\n\
-             修改配置后需重启 VimGlide。",
+             修改配置后可从托盘菜单选择「重新载入配置」生效。",
             self.hint_hotkey,
             self.config_path.display()
         );

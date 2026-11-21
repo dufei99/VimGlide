@@ -113,7 +113,7 @@ fn sanitize_alphabet(alphabet: &str) -> Vec<char> {
 
 /// 生成标签，规则如下：
 /// 1. 优先用元素名称的首字母作为单字符助记标签（仅当该首字母唯一时）；
-/// 2. 其余元素用「首字符不与单字符标签冲突」的双字符标签；
+/// 2. 剩余元素不足以占用不同单字符时，改用「首字符不与单字符标签冲突」的双字符标签；
 /// 3. 标签数量不够时整体退化为等长三字符标签。
 /// 这样能保证任何标签都不是其它标签的前缀。
 fn generate_labels(targets: &[Target], alphabet: &[char]) -> Vec<String> {
@@ -144,26 +144,41 @@ fn generate_labels(targets: &[Target], alphabet: &[char]) -> Vec<String> {
     // 双字符标签：首字符避开单字符标签，保证前缀唯一。
     let remaining = labels.iter().filter(|l| l.is_none()).count();
     if remaining > 0 {
-        let mut pairs = alphabet
+        let free_singles: Vec<char> = alphabet
             .iter()
+            .copied()
             .filter(|c| !single_chars.contains(c))
-            .flat_map(|a| alphabet.iter().map(move |b| format!("{a}{b}")));
+            .collect();
 
-        let capacity = (alphabet.len() - single_chars.len()) * alphabet.len();
-        if remaining <= capacity {
+        // 剩余元素能用不同单字符区分时，优先用单字符（如少量中文名称的按钮）。
+        if remaining <= free_singles.len() {
+            let mut singles = free_singles.into_iter();
             for slot in labels.iter_mut() {
                 if slot.is_none() {
-                    *slot = pairs.next();
+                    *slot = singles.next().map(|c| c.to_string());
                 }
             }
         } else {
-            // 极端情况（元素过多）：全部改为 3 字符标签。
-            let mut triples = alphabet.iter().flat_map(|a| {
-                alphabet
-                    .iter()
-                    .flat_map(move |b| alphabet.iter().map(move |c| format!("{a}{b}{c}")))
-            });
-            labels = (0..n).map(|_| triples.next()).collect();
+            let mut pairs = free_singles
+                .iter()
+                .flat_map(|a| alphabet.iter().map(move |b| format!("{a}{b}")));
+
+            let capacity = free_singles.len() * alphabet.len();
+            if remaining <= capacity {
+                for slot in labels.iter_mut() {
+                    if slot.is_none() {
+                        *slot = pairs.next();
+                    }
+                }
+            } else {
+                // 极端情况（元素过多）：全部改为 3 字符标签。
+                let mut triples = alphabet.iter().flat_map(|a| {
+                    alphabet
+                        .iter()
+                        .flat_map(move |b| alphabet.iter().map(move |c| format!("{a}{b}{c}")))
+                });
+                labels = (0..n).map(|_| triples.next()).collect();
+            }
         }
     }
 
@@ -235,8 +250,21 @@ mod tests {
             vec![target("Open", 0, 0), target("", 0, 40)],
             "osd",
         );
-        assert_eq!(hints.labels(), &["o", "so"]);
+        assert_eq!(hints.labels(), &["o", "s"]);
         assert_eq!(hints.press('o'), Press::Selected(0));
+    }
+
+    #[test]
+    fn few_targets_without_mnemonic_use_single_char() {
+        let hints = HintSet::new(
+            vec![
+                target("最小化", 0, 0),
+                target("最大化", 0, 40),
+                target("关闭", 0, 80),
+            ],
+            "sadfjklewcmpgh",
+        );
+        assert_eq!(hints.labels(), &["s", "a", "d"]);
     }
 
     #[test]

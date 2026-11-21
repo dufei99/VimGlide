@@ -215,4 +215,35 @@ impl TextRenderer {
             pen += metrics.advance_width;
         }
     }
+
+    /// 带描边的文本：先在四周偏移处画一圈 `halo` 色，再画正文，
+    /// 这样标签底色可以做成半透明而不影响可读性。
+    pub fn draw_outlined(
+        &self,
+        canvas: &mut Canvas,
+        text: &str,
+        x: f32,
+        baseline: f32,
+        px: f32,
+        color: Color,
+        halo: Color,
+    ) {
+        let radius = (px / 14.0).round().clamp(1.0, 2.0) as i32;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                self.draw(
+                    canvas,
+                    text,
+                    x + dx as f32,
+                    baseline + dy as f32,
+                    px,
+                    halo,
+                );
+            }
+        }
+        self.draw(canvas, text, x, baseline, px, color);
+    }
 }

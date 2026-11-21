@@ -63,6 +63,26 @@ impl App {
         self.render(backend);
     }
 
+    /// 应用重新载入的配置；热键由平台层负责更新。
+    pub fn apply_config(&mut self, backend: &mut dyn Backend, config: Config) {
+        self.config = config;
+        if self.visible {
+            self.render(backend);
+        }
+    }
+
+    /// 显示一条临时消息（成功或错误）。
+    pub fn show_message(&mut self, backend: &mut dyn Backend, text: String, error: bool) {
+        self.visible = true;
+        self.hints = None;
+        self.notice = Some(Notice {
+            text,
+            until: Instant::now() + Duration::from_millis(if error { 4000 } else { 1600 }),
+            error,
+        });
+        self.render(backend);
+    }
+
     /// 退出提示模式并隐藏遮罩。
     pub fn dismiss(&mut self, backend: &mut dyn Backend) {
         self.visible = false;
@@ -206,7 +226,10 @@ impl App {
         let Some(hints) = &self.hints else {
             return;
         };
-        let (x, y) = hints.target(index).rect.center();
+        // 点击点靠左：很多控件的有效区域在左侧的图标/文字处，而矩形可能很宽。
+        let rect = hints.target(index).rect;
+        let inset = (rect.w / 5).clamp(1, 24);
+        let (x, y) = (rect.x + inset, rect.y + rect.h / 2);
         self.dismiss(backend);
         // 等遮罩消失一帧再点击，避免视觉上的残影。
         std::thread::sleep(Duration::from_millis(15));
@@ -335,14 +358,15 @@ impl App {
 
             let baseline = box_rect.y as f32 + (box_rect.h as f32 + text.ascent(font_px)) / 2.0;
             let start_x = box_rect.x as f32 + pad_x;
+            // 标签底色半透明，给字母描一圈对比色边，保证可读性。
             let split = buffer.len().min(label.len());
             if filtering && split > 0 {
                 let (prefix, rest) = label.split_at(split);
                 let prefix_w = text.measure(prefix, font_px);
-                text.draw(canvas, prefix, start_x, baseline, font_px, prefix_fg);
-                text.draw(canvas, rest, start_x + prefix_w, baseline, font_px, fg);
+                text.draw_outlined(canvas, prefix, start_x, baseline, font_px, prefix_fg, halo_for(prefix_fg));
+                text.draw_outlined(canvas, rest, start_x + prefix_w, baseline, font_px, fg, halo_for(fg));
             } else {
-                text.draw(canvas, label, start_x, baseline, font_px, fg);
+                text.draw_outlined(canvas, label, start_x, baseline, font_px, fg, halo_for(fg));
             }
         }
     }
@@ -400,6 +424,16 @@ impl App {
         );
         let baseline = rect.y as f32 + (rect.h as f32 + text.ascent(font_px)) / 2.0;
         text.draw(canvas, &message, rect.x as f32 + pad_x, baseline, font_px, color);
+    }
+}
+
+/// 按文字亮度选择描边色：深色字配白边，浅色字配黑边。
+fn halo_for(fg: Color) -> Color {
+    let luma = 0.299 * fg.r as f32 + 0.587 * fg.g as f32 + 0.114 * fg.b as f32;
+    if luma < 128.0 {
+        Color::rgba(255, 255, 255, 235)
+    } else {
+        Color::rgba(0, 0, 0, 200)
     }
 }
 

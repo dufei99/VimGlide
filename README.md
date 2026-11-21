@@ -16,7 +16,7 @@
 - **助记式标签**：优先用元素名称首字母做单字符助记标签（如 `Save` → `s`），冲突时退化为双字符标签，不会出现「一个标签是另一个标签前缀」的歧义。
 - **输入即筛选**：已输入前缀高亮，未匹配的标签自动隐藏，HUD 实时显示剩余数量。
 - **Vim 风格滚动**：提示模式下可直接用 `j k h l d u g G`、方向键、PageUp/PageDown、Home/End 滚动页面。
-- **托盘常驻**：左键打开帮助，右键打开菜单（显示提示、打开配置、帮助、以管理员身份重启、退出）。
+- **托盘常驻**：左键打开帮助，右键打开菜单（显示提示、打开配置、重新载入配置、帮助、以管理员身份重启、退出）。
 - **热键被占用时自动退让**：默认热键注册失败会依次尝试 `ctrl+alt+space`、`alt+shift+space`。
 - **完全可配置**：热键、标签字符表、配色、字号、滚动步长都写在 TOML 里。
 
@@ -88,7 +88,7 @@ UI Automation 无法读取权限层级更高的窗口。如果目标窗口以管
 
 ## 配置
 
-首次运行会自动生成 `%APPDATA%\VimGlide\config.toml`（带注释化的默认值）。修改后需要**重启 VimGlide** 生效。
+首次运行会自动生成 `%APPDATA%\VimGlide\config.toml`（带注释化的默认值）。修改后从托盘菜单选择**重新载入配置**即可生效（热键也会重新注册），无需重启。
 
 ```toml
 [hotkey]
@@ -98,10 +98,10 @@ quit = "ctrl+shift+alt+q"      # 退出进程
 [hint]
 chars = "sadfjklewcmpgh"       # 标签字符表（自动去重，仅保留 a-z 0-9）
 font_size = 14.0               # 逻辑像素，会按 DPI 缩放
-label_bg = "#fdf6b2"
-label_fg = "#202020"
+label_bg = "#fdf6b211"         # 支持 #RRGGBB 或 #RRGGBBAA，末两位为透明度
+label_fg = "#005700"
 label_border = "#e2c94f"
-matched_bg = "#7ee787"         # 已匹配标签
+matched_bg = "#7ee78799"       # 已匹配标签
 matched_fg = "#0b2b13"
 prefix_fg = "#b32020"          # 已输入前缀
 outline = "#9a9a9a"            # 元素描边

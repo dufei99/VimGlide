@@ -7,9 +7,9 @@ mod tray;
 mod uia;
 
 use std::cell::Cell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use windows::core::{w, PCWSTR};
@@ -68,9 +68,9 @@ static CAPTURE: AtomicBool = AtomicBool::new(false);
 /// 叠加层窗口句柄，钩子用它投递消息。
 static OVERLAY_HWND: AtomicIsize = AtomicIsize::new(0);
 /// 生效的提示热键，用于捕获期间再次触发退出。
-static HINT_SPEC: OnceLock<HotkeySpec> = OnceLock::new();
+static HINT_SPEC: Mutex<Option<HotkeySpec>> = Mutex::new(None);
 /// 退出热键，捕获期间需要放行给系统处理。
-static QUIT_SPEC: OnceLock<HotkeySpec> = OnceLock::new();
+static QUIT_SPEC: Mutex<Option<HotkeySpec>> = Mutex::new(None);
 
 /// 消息循环中分发给 App 的运行时指针。
 ///
@@ -119,8 +119,12 @@ pub struct WindowsBackend {
     _hook: HookHandle,
     /// 托盘图标；创建失败不影响主要功能。
     tray: Option<tray::Tray>,
+    config_path: PathBuf,
     /// 实际生效的提示热键（可能与配置不同，见 `new`）。
     hint_hotkey: String,
+    hint_spec: HotkeySpec,
+    quit_hotkey: String,
+    quit_spec: HotkeySpec,
     /// 本进程是否以管理员身份运行。
     elevated: bool,
     /// 上一次采集是否因为前台窗口权限更高而失败。
@@ -143,28 +147,9 @@ impl WindowsBackend {
         desktop: Desktop,
         overlay: Overlay,
     ) -> Result<Self, String> {
-        let hint_spec = HotkeySpec::parse(&config.hotkey.hint)?;
         let mut hotkeys = Hotkeys::new(overlay.hwnd());
-
-        let mut candidates = vec![(config.hotkey.hint.clone(), hint_spec)];
-        for text in HINT_HOTKEY_FALLBACKS {
-            if let Ok(spec) = HotkeySpec::parse(text) {
-                candidates.push((text.to_string(), spec));
-            }
-        }
-
-        let mut active: Option<(String, HotkeySpec)> = None;
-        let mut last_error = String::new();
-        for (text, spec) in &candidates {
-            match hotkeys.register(HOTKEY_HINT, spec, text) {
-                Ok(()) => {
-                    active = Some((text.clone(), *spec));
-                    break;
-                }
-                Err(e) => last_error = e,
-            }
-        }
-        let (hint_hotkey, hint_spec) = active.ok_or(last_error)?;
+        let (hint_hotkey, hint_spec) =
+            Self::register_hint(&mut hotkeys, config.hotkey.hint.clone())?;
         if hint_hotkey != config.hotkey.hint {
             eprintln!(
                 "VimGlide: 热键 `{}` 已被占用，改用 `{hint_hotkey}`",
@@ -173,14 +158,14 @@ impl WindowsBackend {
         }
 
         // 退出热键被占用不影响主要功能，只提示一下。
-        let quit_spec = HotkeySpec::parse(&config.hotkey.quit)?;
-        if let Err(e) = hotkeys.register(HOTKEY_QUIT, &quit_spec, &config.hotkey.quit) {
+        let quit_hotkey = config.hotkey.quit.clone();
+        let quit_spec = HotkeySpec::parse(&quit_hotkey)?;
+        if let Err(e) = hotkeys.register(HOTKEY_QUIT, &quit_spec, &quit_hotkey) {
             eprintln!("VimGlide: {e}（可继续使用 Esc 退出提示模式）");
         }
 
         OVERLAY_HWND.store(overlay.hwnd().0 as isize, Ordering::SeqCst);
-        let _ = HINT_SPEC.set(hint_spec);
-        let _ = QUIT_SPEC.set(quit_spec);
+        Self::set_specs(Some(hint_spec), Some(quit_spec));
 
         let elevated = is_elevated();
         let tray = match tray::Tray::new(
@@ -208,7 +193,11 @@ impl WindowsBackend {
             _hotkeys: hotkeys,
             _hook: hook,
             tray,
+            config_path: config_path.to_path_buf(),
             hint_hotkey,
+            hint_spec,
+            quit_hotkey,
+            quit_spec,
             elevated,
             needs_admin: false,
             scan_root: HWND::default(),
@@ -216,6 +205,108 @@ impl WindowsBackend {
             uia: None,
             uia_unavailable: false,
         })
+    }
+
+    /// 注册提示热键；配置值被占用时依次尝试备用热键。
+    fn register_hint(hotkeys: &mut Hotkeys, hint: String) -> Result<(String, HotkeySpec), String> {
+        let spec = HotkeySpec::parse(&hint)?;
+        let mut candidates = vec![(hint, spec)];
+        for text in HINT_HOTKEY_FALLBACKS {
+            if let Ok(spec) = HotkeySpec::parse(text) {
+                candidates.push((text.to_string(), spec));
+            }
+        }
+        let mut last_error = String::new();
+        for (text, spec) in candidates {
+            match hotkeys.register(HOTKEY_HINT, &spec, &text) {
+                Ok(()) => return Ok((text, spec)),
+                Err(e) => last_error = e,
+            }
+        }
+        Err(last_error)
+    }
+
+    fn set_specs(hint: Option<HotkeySpec>, quit: Option<HotkeySpec>) {
+        if let Ok(mut slot) = HINT_SPEC.lock() {
+            *slot = hint;
+        }
+        if let Ok(mut slot) = QUIT_SPEC.lock() {
+            *slot = quit;
+        }
+    }
+
+    /// 从磁盘重新载入配置：热键重新注册，其余设置交给 App。
+    fn reload_config(&mut self, app: &mut App) {
+        let config = match Config::from_path(&self.config_path) {
+            Ok(config) => config,
+            Err(e) => {
+                // 错误信息可能包含中文，遮罩字体不含中文字形，改用消息框显示。
+                if let Some(tray) = &self.tray {
+                    tray.show_error(&e);
+                } else {
+                    eprintln!("VimGlide: {e}");
+                }
+                return;
+            }
+        };
+
+        self._hotkeys.unregister(HOTKEY_HINT);
+        self._hotkeys.unregister(HOTKEY_QUIT);
+
+        let Ok((hint_hotkey, hint_spec)) =
+            Self::register_hint(&mut self._hotkeys, config.hotkey.hint.clone())
+        else {
+            // 新热键不可用：恢复旧热键，配置保持原样。
+            let _ = self
+                ._hotkeys
+                .register(HOTKEY_HINT, &self.hint_spec, &self.hint_hotkey);
+            let _ = self
+                ._hotkeys
+                .register(HOTKEY_QUIT, &self.quit_spec, &self.quit_hotkey);
+            app.show_message(
+                self,
+                format!(
+                    "VimGlide: hotkey `{}` unavailable, config not reloaded",
+                    config.hotkey.hint
+                ),
+                true,
+            );
+            return;
+        };
+
+        let (quit_hotkey, quit_spec) = match HotkeySpec::parse(&config.hotkey.quit) {
+            Ok(spec)
+                if self
+                    ._hotkeys
+                    .register(HOTKEY_QUIT, &spec, &config.hotkey.quit)
+                    .is_ok() =>
+            {
+                (config.hotkey.quit.clone(), spec)
+            }
+            _ => {
+                // 退出热键不可用时沿用旧的。
+                let _ = self
+                    ._hotkeys
+                    .register(HOTKEY_QUIT, &self.quit_spec, &self.quit_hotkey);
+                (self.quit_hotkey.clone(), self.quit_spec)
+            }
+        };
+
+        self.hint_hotkey = hint_hotkey.clone();
+        self.hint_spec = hint_spec;
+        self.quit_hotkey = quit_hotkey.clone();
+        self.quit_spec = quit_spec;
+        Self::set_specs(Some(hint_spec), Some(quit_spec));
+        if let Some(tray) = &mut self.tray {
+            tray.update_hotkeys(&hint_hotkey, &quit_hotkey);
+        }
+
+        app.apply_config(self, config);
+        app.show_message(
+            self,
+            format!("VimGlide: config reloaded ({hint_hotkey})"),
+            false,
+        );
     }
 
     fn message_loop(&mut self, app: &mut App) -> Result<(), String> {
@@ -390,6 +481,7 @@ pub(super) unsafe extern "system" fn wnd_proc(
                             }
                         }
                     }
+                    tray::TrayAction::Reload => backend.reload_config(app),
                     tray::TrayAction::Help => {
                         if let Some(tray) = &backend.tray {
                             tray.show_help();
@@ -475,19 +567,15 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     let meta = key_down(VK_LWIN) || key_down(VK_RWIN);
 
     // 捕获期间再次按提示热键 = 退出提示模式。
-    if HINT_SPEC
-        .get()
-        .is_some_and(|spec| spec.matches(kb.vkCode, ctrl, alt, shift, meta))
-    {
+    let hint_spec = HINT_SPEC.lock().ok().and_then(|slot| *slot);
+    if hint_spec.is_some_and(|spec| spec.matches(kb.vkCode, ctrl, alt, shift, meta)) {
         post_key(hwnd, kb.vkCode, FLAG_TOGGLE);
         return LRESULT(1);
     }
 
     // 退出热键交给系统（放行），否则会把用户锁在提示模式里。
-    if QUIT_SPEC
-        .get()
-        .is_some_and(|spec| spec.matches(kb.vkCode, ctrl, alt, shift, meta))
-    {
+    let quit_spec = QUIT_SPEC.lock().ok().and_then(|slot| *slot);
+    if quit_spec.is_some_and(|spec| spec.matches(kb.vkCode, ctrl, alt, shift, meta)) {
         return passthrough(code);
     }
 

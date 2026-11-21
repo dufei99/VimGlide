@@ -84,12 +84,12 @@ impl Default for HotkeyConfig {
 impl Default for HintConfig {
     fn default() -> Self {
         Self {
-            chars: "sadfjklewcmpgh".to_string(),
-            font_size: 14.0,
-            label_bg: "#fdf6b2".to_string(),
-            label_fg: "#202020".to_string(),
+            chars: "sadfjklewcmpghiormnvcx".to_string(),
+            font_size: 16.0,
+            label_bg: "#fdf6b211".to_string(),
+            label_fg: "#005700".to_string(),
             label_border: "#e2c94f".to_string(),
-            matched_bg: "#7ee787".to_string(),
+            matched_bg: "#7ee78799".to_string(),
             matched_fg: "#0b2b13".to_string(),
             prefix_fg: "#b32020".to_string(),
             outline: "#9a9a9a".to_string(),
@@ -133,12 +133,17 @@ impl Config {
             write_default(&path)?;
         }
 
-        let text = std::fs::read_to_string(&path)
+        Ok((Config::from_path(&path)?, path))
+    }
+
+    /// 从指定路径读取配置（不写默认文件），用于启动与手动重新载入。
+    pub fn from_path(path: &Path) -> Result<Config, String> {
+        let text = std::fs::read_to_string(path)
             .map_err(|e| format!("读取配置文件 {} 失败：{e}", path.display()))?;
         let config: Config = toml::from_str(&text)
             .map_err(|e| format!("解析配置文件 {} 失败：{e}", path.display()))?;
         config.validate()?;
-        Ok((config, path))
+        Ok(config)
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -173,7 +178,7 @@ fn write_default(path: &Path) -> Result<(), String> {
     }
     let body = toml::to_string_pretty(&Config::default())
         .map_err(|e| format!("生成默认配置失败：{e}"))?;
-    let header = "# VimGlide 配置\n# 修改后需要重启 VimGlide 才会生效。\n\n";
+    let header = "# VimGlide 配置\n# 修改后从托盘菜单选择「重新载入配置」即可生效。\n\n";
     std::fs::write(path, format!("{header}{body}"))
         .map_err(|e| format!("写入默认配置 {} 失败：{e}", path.display()))
 }

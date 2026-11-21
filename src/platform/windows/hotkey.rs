@@ -155,6 +155,15 @@ impl Hotkeys {
         self.ids.push(id);
         Ok(())
     }
+
+    /// 注销指定热键；未注册时忽略。
+    pub fn unregister(&mut self, id: i32) {
+        if let Some(position) = self.ids.iter().position(|registered| *registered == id) {
+            self.ids.remove(position);
+            // SAFETY: 与注册时相同的 hwnd 与 id。
+            let _ = unsafe { UnregisterHotKey(Some(self.hwnd), id) };
+        }
+    }
 }
 
 impl Drop for Hotkeys {
