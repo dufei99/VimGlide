@@ -86,7 +86,7 @@ impl Default for HintConfig {
         Self {
             chars: "sadfjklewcmpghiormnvcx".to_string(),
             font_size: 16.0,
-            label_bg: "#fdf6b211".to_string(),
+            label_bg: "#fdf6b266".to_string(),
             label_fg: "#005700".to_string(),
             label_border: "#e2c94f".to_string(),
             matched_bg: "#7ee78799".to_string(),

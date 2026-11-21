@@ -98,7 +98,7 @@ quit = "ctrl+shift+alt+q"      # 退出进程
 [hint]
 chars = "sadfjklewcmpgh"       # 标签字符表（自动去重，仅保留 a-z 0-9）
 font_size = 14.0               # 逻辑像素，会按 DPI 缩放
-label_bg = "#fdf6b211"         # 支持 #RRGGBB 或 #RRGGBBAA，末两位为透明度
+label_bg = "#fdf6b266"         # 支持 #RRGGBB 或 #RRGGBBAA，末两位为透明度
 label_fg = "#005700"
 label_border = "#e2c94f"
 matched_bg = "#7ee78799"       # 已匹配标签
