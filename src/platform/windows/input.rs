@@ -3,34 +3,15 @@
 use std::thread::sleep;
 use std::time::Duration;
 
+use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_MOUSE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
+    INPUT, INPUT_0, INPUT_MOUSE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT, SendInput,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-};
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
 
 const WHEEL_DELTA: i32 = 120;
-
-/// 把屏幕坐标换算成 SendInput 需要的 0..=65535 归一化坐标（覆盖整个虚拟桌面）。
-fn to_absolute(x: i32, y: i32) -> (i32, i32) {
-    // SAFETY: 纯查询调用。
-    let (left, top, width, height) = unsafe {
-        (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN),
-        )
-    };
-    let span_x = (width - 1).max(1) as i64;
-    let span_y = (height - 1).max(1) as i64;
-    let nx = ((x - left) as i64 * 65535 / span_x).clamp(0, 65535) as i32;
-    let ny = ((y - top) as i64 * 65535 / span_y).clamp(0, 65535) as i32;
-    (nx, ny)
-}
 
 fn mouse_input(dx: i32, dy: i32, data: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
     INPUT {
@@ -56,33 +37,48 @@ fn send(inputs: &[INPUT]) {
 }
 
 pub fn move_to(x: i32, y: i32) {
-    let (nx, ny) = to_absolute(x, y);
-    send(&[mouse_input(
-        nx,
-        ny,
-        0,
-        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-    )]);
+    // SAFETY: 纯定位调用，坐标超出桌面时系统会自动收敛到边缘。
+    unsafe {
+        let _ = SetCursorPos(x, y);
+    }
 }
 
-pub fn click(x: i32, y: i32) {
-    move_to(x, y);
-    sleep(Duration::from_millis(10));
+/// 相对移动鼠标（像素）。
+pub fn nudge(dx: i32, dy: i32) {
+    let (x, y) = cursor_position();
+    move_to(x + dx, y + dy);
+}
+
+/// 当前光标位置（物理像素）。
+pub fn cursor_position() -> (i32, i32) {
+    let mut point = POINT::default();
+    // SAFETY: 纯查询调用，写入本栈上的 POINT。
+    unsafe {
+        let _ = GetCursorPos(&mut point);
+    }
+    (point.x, point.y)
+}
+
+/// 在当前位置单击，不移动鼠标（定位已由提示模式完成）。
+pub fn click_here() {
     send(&[mouse_input(0, 0, 0, MOUSEEVENTF_LEFTDOWN)]);
     sleep(Duration::from_millis(10));
     send(&[mouse_input(0, 0, 0, MOUSEEVENTF_LEFTUP)]);
 }
 
-/// 双击（桌面图标、文件列表等需要双击才会打开）。
-pub fn double_click(x: i32, y: i32) {
-    move_to(x, y);
-    sleep(Duration::from_millis(10));
+/// 在当前位置双击。
+pub fn double_click_here() {
     for _ in 0..2 {
-        send(&[mouse_input(0, 0, 0, MOUSEEVENTF_LEFTDOWN)]);
-        sleep(Duration::from_millis(10));
-        send(&[mouse_input(0, 0, 0, MOUSEEVENTF_LEFTUP)]);
+        click_here();
         sleep(Duration::from_millis(40));
     }
+}
+
+/// 在当前位置右击。
+pub fn right_click_here() {
+    send(&[mouse_input(0, 0, 0, MOUSEEVENTF_RIGHTDOWN)]);
+    sleep(Duration::from_millis(10));
+    send(&[mouse_input(0, 0, 0, MOUSEEVENTF_RIGHTUP)]);
 }
 
 /// 滚轮：vertical 为垂直刻度（正=向下），horizontal 为水平刻度（正=向右）。

@@ -20,6 +20,8 @@ pub struct HintSet {
     targets: Vec<Target>,
     labels: Vec<String>,
     buffer: String,
+    /// 已确定的目标；选中后等待用户按空格执行动作。
+    selected: Option<usize>,
 }
 
 impl HintSet {
@@ -30,6 +32,7 @@ impl HintSet {
             targets,
             labels,
             buffer: String::new(),
+            selected: None,
         }
     }
 
@@ -90,10 +93,22 @@ impl HintSet {
     /// 退格。
     pub fn backspace(&mut self) {
         self.buffer.pop();
+        self.selected = None;
     }
 
     pub fn clear(&mut self) {
         self.buffer.clear();
+        self.selected = None;
+    }
+
+    /// 标记选中的目标：标签已完整输入，等待用户确认动作。
+    pub fn select(&mut self, index: usize) {
+        self.selected = Some(index);
+    }
+
+    /// 当前选中的目标。
+    pub fn selected(&self) -> Option<usize> {
+        self.selected
     }
 }
 

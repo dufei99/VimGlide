@@ -8,7 +8,15 @@ use crate::config::Config;
 use crate::hint::{HintSet, Press};
 use crate::model::Rect;
 use crate::platform::{Backend, Desktop, Key};
-use crate::render::{Canvas, Color, TextRenderer};
+use crate::render::{Color, Scene, TextBlock, TextRun};
+
+/// 选中目标后要执行的动作。
+#[derive(Clone, Copy)]
+enum ClickAction {
+    Left,
+    Double,
+    Right,
+}
 
 /// 短暂显示在 HUD 上的提示信息。
 struct Notice {
@@ -19,26 +27,24 @@ struct Notice {
 
 pub struct App {
     config: Config,
-    canvas: Canvas,
-    /// 字体渲染器按需创建：仅在遮罩可见时持有，隐藏后释放。
-    text: Option<TextRenderer>,
     hints: Option<HintSet>,
     notice: Option<Notice>,
     visible: bool,
     /// 虚拟桌面左上角，用于把屏幕坐标换算成画布坐标。
     origin: (i32, i32),
+    /// 选中后正在用 hjkl 移动光标：方向、按下开始时间、上一次移动时间。
+    moving: Option<(char, Instant, Instant)>,
 }
 
 impl App {
     pub fn new(config: Config, desktop: &Desktop) -> Result<Self, String> {
         Ok(Self {
-            canvas: Canvas::new(0, 0),
             config,
-            text: None,
             hints: None,
             notice: None,
             visible: false,
             origin: (desktop.screen.x, desktop.screen.y),
+            moving: None,
         })
     }
 
@@ -88,11 +94,9 @@ impl App {
         self.visible = false;
         self.hints = None;
         self.notice = None;
+        self.moving = None;
         backend.set_key_capture(false);
         backend.hide();
-        // 释放整屏画布（约 8MB/1080p）与字体数据，下次显示时再分配。
-        self.canvas.release();
-        self.text = None;
     }
 
     fn activate(&mut self, backend: &mut dyn Backend) {
@@ -101,7 +105,7 @@ impl App {
         // 先记录前台窗口：遮罩显示时可能为了盖住任务栏而抢占前台。
         backend.begin_hints();
         self.notice = Some(Notice {
-            text: "VimGlide: scanning clickable elements ...".to_string(),
+            text: "正在识别可点击元素 ...".to_string(),
             until: Instant::now() + Duration::from_secs(10),
             error: false,
         });
@@ -114,18 +118,43 @@ impl App {
             let needs_admin = backend.needs_admin();
             self.notice = Some(Notice {
                 text: if needs_admin {
-                    "VimGlide: window runs as admin - restart as administrator from tray menu"
-                        .to_string()
+                    "前台窗口以管理员权限运行，请从托盘菜单以管理员身份重启".to_string()
                 } else {
-                    "VimGlide: no clickable elements found".to_string()
+                    "没有找到可点击的元素".to_string()
                 },
                 until: Instant::now() + Duration::from_millis(if needs_admin { 2600 } else { 1200 }),
                 error: true,
             });
         } else {
-            self.hints = Some(HintSet::new(targets, &self.config.hint.chars));
-            self.notice = None;
+            let hints = HintSet::new(targets, &self.config.hint.chars);
+            // 标签出现时先给出完整用法提示，3 秒后自动消失，按 ? 可再次显示。
+            self.notice = Some(Notice {
+                text: Self::help_message(hints.len()),
+                until: Instant::now() + Duration::from_secs(3),
+                error: false,
+            });
+            self.hints = Some(hints);
         }
+        self.render(backend);
+    }
+
+    /// 帮助提示文案：目标数量 + 可用按键。
+    fn help_message(count: usize) -> String {
+        format!(
+            "找到 {count} 个标签   输入标签后按 hjkl 微调光标   空格单击   shift+空格双击   ctrl+空格右击   esc 取消"
+        )
+    }
+
+    /// 显示帮助提示（? 键），3 秒后自动消失。
+    fn show_help(&mut self, backend: &mut dyn Backend) {
+        let Some(count) = self.hints.as_ref().map(|hints| hints.len()) else {
+            return;
+        };
+        self.notice = Some(Notice {
+            text: Self::help_message(count),
+            until: Instant::now() + Duration::from_secs(3),
+            error: false,
+        });
         self.render(backend);
     }
 
@@ -135,12 +164,38 @@ impl App {
             return;
         }
         match key {
-            Key::Escape => self.dismiss(backend),
+            // 有选中项时先取消选中，再按一次才退出提示模式。
+            Key::Escape => {
+                if self.hints.as_ref().and_then(|hints| hints.selected()).is_some() {
+                    if let Some(hints) = &mut self.hints {
+                        hints.clear();
+                    }
+                    self.moving = None;
+                    self.render(backend);
+                } else {
+                    self.dismiss(backend);
+                }
+            }
             Key::Backspace => {
                 if let Some(hints) = &mut self.hints {
                     hints.backspace();
                 }
+                self.moving = None;
+                // 输入时收起帮助，让位给筛选进度。
+                self.notice = None;
                 self.render(backend);
+            }
+            // ? 重新显示帮助提示。
+            Key::Char('?') => self.show_help(backend),
+            Key::Space { shift, ctrl } => {
+                let action = if ctrl {
+                    ClickAction::Right
+                } else if shift {
+                    ClickAction::Double
+                } else {
+                    ClickAction::Left
+                };
+                self.commit(backend, action);
             }
             Key::Char(c) => self.handle_char(backend, c),
             Key::Up => self.scroll(backend, -self.config.scroll.step_notches, 0),
@@ -156,8 +211,19 @@ impl App {
     }
 
     fn handle_char(&mut self, backend: &mut dyn Backend, c: char) {
-        if c == ' ' {
-            return;
+        // 输入标签时收起帮助提示。
+        self.notice = None;
+        // 选中后 hjkl 用来微调光标位置，其它字母则放弃选择、重新输入。
+        if self.hints.as_ref().is_some_and(|hints| hints.selected().is_some()) {
+            let dir = c.to_ascii_lowercase();
+            if matches!(dir, 'h' | 'j' | 'k' | 'l') {
+                self.nudge_cursor(backend, dir, c.is_ascii_uppercase());
+                return;
+            }
+            if let Some(hints) = &mut self.hints {
+                hints.clear();
+            }
+            self.moving = None;
         }
         let empty_before = self
             .hints
@@ -191,12 +257,58 @@ impl App {
                 hints.clear();
             }
             self.notice = Some(Notice {
-                text: format!("VimGlide: no hint starts with '{lower}'"),
+                text: format!("没有以 '{lower}' 开头的标签"),
                 until: Instant::now() + Duration::from_millis(700),
                 error: true,
             });
         }
         self.render(backend);
+    }
+
+    /// 标签输入完整后：高亮目标，并把鼠标移到点击位置，等待空格或 hjkl 微调。
+    fn select(&mut self, backend: &mut dyn Backend, index: usize) {
+        let Some(hints) = &self.hints else {
+            return;
+        };
+        // 点击点靠左：很多控件的有效区域在左侧的图标/文字处，而矩形可能很宽。
+        let rect = hints.target(index).rect;
+        let inset = (rect.w / 5).clamp(1, 24);
+        let (x, y) = (rect.x + inset, rect.y + rect.h / 2);
+        if let Some(hints) = &mut self.hints {
+            hints.select(index);
+        }
+        self.moving = None;
+        backend.move_cursor(x, y);
+        self.render(backend);
+    }
+
+    /// 选中后按 hjkl 微调光标：步长与加速由 `[move]` 配置，长按逐渐加速。
+    fn nudge_cursor(&mut self, backend: &mut dyn Backend, dir: char, shift: bool) {
+        let now = Instant::now();
+        let cfg = &self.config.movement;
+        // 只有键盘自动重复（事件间隔很短）才加速，手动连点保持原步长。
+        let (started, mult) = match self.moving {
+            Some((last, started, at)) if last == dir => {
+                if now.duration_since(at) < Duration::from_millis(80) {
+                    let held = now.duration_since(started).as_millis() as i64;
+                    let interval = cfg.accel_ms.max(20) as i64;
+                    (started, (1 + held / interval).clamp(1, cfg.accel_max as i64))
+                } else {
+                    (now, 1)
+                }
+            }
+            _ => (now, 1),
+        };
+        self.moving = Some((dir, started, now));
+        let step = if shift { cfg.shift_step } else { cfg.step } * mult as i32;
+        let (dx, dy) = match dir {
+            'h' => (-step, 0),
+            'l' => (step, 0),
+            'k' => (0, -step),
+            'j' => (0, step),
+            _ => return,
+        };
+        backend.nudge_cursor(dx, dy);
     }
 
     /// j/k/h/l/d/u/g/G 滚动；返回是否命中。
@@ -222,18 +334,41 @@ impl App {
         backend.scroll(vertical, horizontal);
     }
 
-    fn select(&mut self, backend: &mut dyn Backend, index: usize) {
-        let Some(hints) = &self.hints else {
+    /// 对选中的目标执行动作：空格单击，Shift+空格双击，Ctrl+空格右击。
+    ///
+    /// 点击位置就是当前光标位置，因此 hjkl 微调后的坐标会被直接使用。
+    /// 点击后若弹出菜单 / 对话框 / 新窗口，会自动为新的 UI 打标签，便于连续操作。
+    fn commit(&mut self, backend: &mut dyn Backend, action: ClickAction) {
+        if self.hints.as_ref().and_then(|hints| hints.selected()).is_none() {
             return;
-        };
-        // 点击点靠左：很多控件的有效区域在左侧的图标/文字处，而矩形可能很宽。
-        let rect = hints.target(index).rect;
-        let inset = (rect.w / 5).clamp(1, 24);
-        let (x, y) = (rect.x + inset, rect.y + rect.h / 2);
-        self.dismiss(backend);
-        // 等遮罩消失一帧再点击，避免视觉上的残影。
+        }
+        // 先隐藏标签再点击，避免残影；键盘捕获暂时保持，等新 UI 出现。
+        backend.hide();
         std::thread::sleep(Duration::from_millis(15));
-        backend.click(x, y);
+        match action {
+            ClickAction::Left => backend.click(false),
+            ClickAction::Double => backend.click(true),
+            ClickAction::Right => backend.right_click(),
+        }
+
+        if !backend.wait_new_ui(Duration::from_millis(600)) {
+            self.dismiss(backend);
+            return;
+        }
+        let targets = backend.collect_chained_targets();
+        if targets.is_empty() {
+            self.dismiss(backend);
+            return;
+        }
+        let hints = HintSet::new(targets, &self.config.hint.chars);
+        self.notice = Some(Notice {
+            text: Self::help_message(hints.len()),
+            until: Instant::now() + Duration::from_secs(3),
+            error: false,
+        });
+        self.hints = Some(hints);
+        self.moving = None;
+        self.render(backend);
     }
 
     /// 定时器回调：处理临时提示的自动消失。
@@ -264,39 +399,22 @@ impl App {
             let desktop = backend.desktop();
             (desktop.scale, desktop.screen)
         };
-        self.canvas
-            .ensure_size(screen.w.max(1) as u32, screen.h.max(1) as u32);
-        self.canvas.clear();
-        if self.text.is_none() {
-            self.text = TextRenderer::new(backend.desktop().font.clone());
+        let config = &self.config;
+        let hints = self.hints.as_ref();
+        let notice = self.notice.as_ref();
+        let origin = self.origin;
+        // 先算好布局，再交给平台后端用 Direct2D 绘制，不再有整屏 CPU 位图。
+        let mut scene = Scene::new(screen.w.max(1) as u32, screen.h.max(1) as u32);
+        if let Some(hints) = hints {
+            Self::paint_hints(&mut scene, backend, config, hints, scale, origin);
         }
-        let Some(text) = self.text.as_ref() else {
-            return;
-        };
-        if let Some(hints) = &self.hints {
-            Self::paint_hints(
-                &mut self.canvas,
-                text,
-                &self.config,
-                hints,
-                scale,
-                self.origin,
-            );
-        }
-        Self::paint_hud(
-            &mut self.canvas,
-            text,
-            &self.config,
-            scale,
-            self.hints.as_ref(),
-            self.notice.as_ref(),
-        );
-        backend.present(&self.canvas);
+        Self::paint_hud(&mut scene, backend, config, scale, hints, notice);
+        backend.present(&scene);
     }
 
     fn paint_hints(
-        canvas: &mut Canvas,
-        text: &TextRenderer,
+        scene: &mut Scene,
+        backend: &mut dyn Backend,
         config: &Config,
         hints: &HintSet,
         scale: f32,
@@ -317,16 +435,18 @@ impl App {
         let outline = Color::hex(&cfg.outline, Color::rgb(154, 154, 154)).with_alpha(cfg.outline_alpha);
 
         let buffer = hints.buffer();
-        let filtering = !buffer.is_empty();
-        let canvas_w = canvas.width() as i32;
-        let canvas_h = canvas.height() as i32;
+        let selected = hints.selected();
+        // 选中后保留全部标签，只高亮选中项；未选中时才按输入前缀过滤。
+        let filtering = !buffer.is_empty() && selected.is_none();
+        let canvas_w = scene.width as i32;
+        let canvas_h = scene.height as i32;
         let mut placed: Vec<Rect> = Vec::new();
 
         for (index, label) in hints.labels().iter().enumerate() {
-            let matched = hints.is_matched(index);
-            if filtering && !matched {
+            if filtering && !hints.is_matched(index) {
                 continue;
             }
+            let emphasize = selected == Some(index) || filtering;
             let target = hints.target(index);
             let rect = Rect::new(
                 target.rect.x - origin.0,
@@ -338,42 +458,66 @@ impl App {
                 continue;
             }
 
-            let thickness = if filtering { 2.0 * scale } else { 1.0 * scale };
-            let stroke = if filtering { matched_bg.with_alpha(230) } else { outline };
-            canvas.stroke_round_rect(rect, 2.0 * scale, thickness, stroke);
+            let thickness = if emphasize { 2.0 * scale } else { 1.0 * scale };
+            let stroke = if emphasize { matched_bg.with_alpha(230) } else { outline };
+            scene.stroke_round_rect(rect, 2.0 * scale, thickness, stroke);
 
-            let (bg, fg) = if filtering {
+            let (bg, fg) = if emphasize {
                 (matched_bg, matched_fg)
             } else {
                 (label_bg, label_fg)
             };
-            let text_w = text.measure(label, font_px);
+            let text_w = backend.measure_text(label, font_px);
             let w = (text_w + pad_x * 2.0).round() as i32;
             let h = (font_px + pad_y * 2.0).round() as i32;
             let box_rect = place_label(rect, w, h, &placed, canvas_w, canvas_h, scale);
             placed.push(box_rect);
 
-            canvas.fill_round_rect(box_rect, radius, label_border.with_alpha(bg.a));
-            canvas.fill_round_rect(box_rect.inset(1, 1), radius - 1.0, bg);
+            scene.fill_round_rect(box_rect, radius, label_border.with_alpha(bg.a));
+            scene.fill_round_rect(box_rect.inset(1, 1), radius - 1.0, bg);
 
-            let baseline = box_rect.y as f32 + (box_rect.h as f32 + text.ascent(font_px)) / 2.0;
-            let start_x = box_rect.x as f32 + pad_x;
             // 标签底色半透明，给字母描一圈对比色边，保证可读性。
-            let split = buffer.len().min(label.len());
-            if filtering && split > 0 {
-                let (prefix, rest) = label.split_at(split);
-                let prefix_w = text.measure(prefix, font_px);
-                text.draw_outlined(canvas, prefix, start_x, baseline, font_px, prefix_fg, halo_for(prefix_fg));
-                text.draw_outlined(canvas, rest, start_x + prefix_w, baseline, font_px, fg, halo_for(fg));
+            // 选中项整块高亮，不再按前缀拆分着色。
+            let split = if selected.is_some() {
+                0
             } else {
-                text.draw_outlined(canvas, label, start_x, baseline, font_px, fg, halo_for(fg));
-            }
+                buffer.len().min(label.len())
+            };
+            let runs = if filtering && split > 0 {
+                let (prefix, rest) = label.split_at(split);
+                vec![
+                    TextRun {
+                        text: prefix.to_string(),
+                        color: prefix_fg,
+                        halo: Some(halo_for(prefix_fg)),
+                    },
+                    TextRun {
+                        text: rest.to_string(),
+                        color: fg,
+                        halo: Some(halo_for(fg)),
+                    },
+                ]
+            } else {
+                vec![TextRun {
+                    text: label.clone(),
+                    color: fg,
+                    halo: Some(halo_for(fg)),
+                }]
+            };
+            scene.text(TextBlock {
+                x: box_rect.x as f32 + pad_x,
+                y: box_rect.y as f32,
+                w: box_rect.w as f32 - pad_x * 2.0,
+                h: box_rect.h as f32,
+                px: font_px,
+                runs,
+            });
         }
     }
 
     fn paint_hud(
-        canvas: &mut Canvas,
-        text: &TextRenderer,
+        scene: &mut Scene,
+        backend: &mut dyn Backend,
         config: &Config,
         scale: f32,
         hints: Option<&HintSet>,
@@ -390,40 +534,50 @@ impl App {
             };
             (notice.text.clone(), color)
         } else if let Some(hints) = hints {
-            let buffer = hints.buffer();
-            let message = if buffer.is_empty() {
-                format!(
-                    "VimGlide   {} targets   type label   arrows scroll   esc exit",
-                    hints.len()
-                )
-            } else {
-                format!(
-                    "VimGlide   [{}]   {} / {}   esc exit",
-                    buffer,
-                    hints.matched_count(),
-                    hints.len()
-                )
-            };
+            // 完整帮助由 Notice 承担并在 3 秒后消失；这里只显示输入前缀时的筛选进度。
+            if hints.selected().is_some() || hints.buffer().is_empty() {
+                return;
+            }
+            let message = format!(
+                "[{}]   {} / {}   esc 退出",
+                hints.buffer(),
+                hints.matched_count(),
+                hints.len()
+            );
             (message, Color::hex(&cfg.fg, Color::rgb(230, 230, 230)))
         } else {
             return;
         };
 
         let pad_x = 12.0 * scale;
-        let width = text.measure(&message, font_px);
+        let width = backend.measure_text(&message, font_px);
         let h = (font_px + 14.0 * scale).round() as i32;
         let w = (width + pad_x * 2.0).round() as i32;
-        let x = ((canvas.width() as i32 - w) / 2).max(0);
-        let y = (canvas.height() as i32 - h - (72.0 * scale) as i32).max(0);
+        let x = ((scene.width as i32 - w) / 2).max(0);
+        let y = (scene.height as i32 - h - (72.0 * scale) as i32).max(0);
         let rect = Rect::new(x, y, w, h);
 
-        canvas.fill_round_rect(
-            rect,
-            9.0 * scale,
-            Color::hex(&cfg.bg, Color::rgb(31, 36, 48)).with_alpha(238),
-        );
-        let baseline = rect.y as f32 + (rect.h as f32 + text.ascent(font_px)) / 2.0;
-        text.draw(canvas, &message, rect.x as f32 + pad_x, baseline, font_px, color);
+        // 背景支持 #RRGGBBAA；只写了 #RRGGBB 时使用 70% 不透明度，和标签保持一致的半透明观感。
+        let bg = Color::hex(&cfg.bg, Color::rgb(31, 36, 48));
+        let bg_alpha = if cfg.bg.trim().trim_start_matches('#').len() == 8 {
+            bg.a
+        } else {
+            0xb3
+        };
+
+        scene.fill_round_rect(rect, 9.0 * scale, bg.with_alpha(bg_alpha));
+        scene.text(TextBlock {
+            x: rect.x as f32 + pad_x,
+            y: rect.y as f32,
+            w: width,
+            h: rect.h as f32,
+            px: font_px,
+            runs: vec![TextRun {
+                text: message,
+                color,
+                halo: None,
+            }],
+        });
     }
 }
 

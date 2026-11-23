@@ -11,6 +11,10 @@ pub struct Config {
     pub hint: HintConfig,
     pub hud: HudConfig,
     pub scroll: ScrollConfig,
+    pub ocr: OcrConfig,
+    /// 选中后用 hjkl 微调光标的步长与加速。
+    #[serde(rename = "move")]
+    pub movement: MoveConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -52,6 +56,18 @@ pub struct HudConfig {
     pub flash: String,
 }
 
+/// UIA 采不到元素时，用 Windows 系统 OCR 识别窗口文字作为兜底。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OcrConfig {
+    /// 是否启用 OCR 兜底。
+    pub enabled: bool,
+    /// UIA 目标少于该数量时才启用 OCR。
+    pub min_uia_targets: usize,
+    /// OCR 追加目标的数量上限，同时也是目标总数上限。
+    pub max_targets: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ScrollConfig {
@@ -61,6 +77,20 @@ pub struct ScrollConfig {
     pub page_notches: i32,
 }
 
+/// 选中后 hjkl 微调光标的参数。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MoveConfig {
+    /// 每次 hjkl 移动的像素。
+    pub step: i32,
+    /// Shift + hjkl 每次移动的像素。
+    pub shift_step: i32,
+    /// 长按自动重复时，每过多少毫秒提升一档。
+    pub accel_ms: u64,
+    /// 加速的最高倍率。
+    pub accel_max: i32,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -68,6 +98,8 @@ impl Default for Config {
             hint: HintConfig::default(),
             hud: HudConfig::default(),
             scroll: ScrollConfig::default(),
+            ocr: OcrConfig::default(),
+            movement: MoveConfig::default(),
         }
     }
 }
@@ -102,7 +134,8 @@ impl Default for HudConfig {
     fn default() -> Self {
         Self {
             font_size: 14.0,
-            bg: "#1f2430".to_string(),
+            // 末两位为透明度，和标签背景一样支持半透明。
+            bg: "#1f2430b3".to_string(),
             fg: "#e6e6e6".to_string(),
             accent: "#7ee787".to_string(),
             flash: "#ff7b72".to_string(),
@@ -115,6 +148,27 @@ impl Default for ScrollConfig {
         Self {
             step_notches: 3,
             page_notches: 15,
+        }
+    }
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_uia_targets: 5,
+            max_targets: 200,
+        }
+    }
+}
+
+impl Default for MoveConfig {
+    fn default() -> Self {
+        Self {
+            step: 2,
+            shift_step: 10,
+            accel_ms: 150,
+            accel_max: 16,
         }
     }
 }
@@ -152,6 +206,12 @@ impl Config {
         }
         if self.hint.chars.trim().is_empty() {
             return Err("hint.chars 不能为空".to_string());
+        }
+        if self.movement.step < 1 || self.movement.shift_step < 1 {
+            return Err("move.step 与 move.shift_step 必须大于 0".to_string());
+        }
+        if self.movement.accel_ms < 20 || self.movement.accel_max < 1 {
+            return Err("move.accel_ms 不能小于 20，move.accel_max 必须大于 0".to_string());
         }
         Ok(())
     }

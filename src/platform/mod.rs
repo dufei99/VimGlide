@@ -14,13 +14,16 @@ mod windows;
 use crate::app::App;
 use crate::config::Config;
 use crate::model::{Rect, Target};
-use crate::render::Canvas;
+use crate::render::Scene;
 
 /// 一次按键（已从平台的键码/字符映射而来）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     /// 字符键，字母保留大小写（Shift+g 会得到 'G'）。
     Char(char),
+    /// 空格键，`shift`/`ctrl` 表示是否同时按下了对应修饰键。
+    /// Shift 用于双击，Ctrl 用于右击。
+    Space { shift: bool, ctrl: bool },
     Backspace,
     Enter,
     Escape,
@@ -42,8 +45,6 @@ pub struct Desktop {
     pub screen: Rect,
     /// 主显示器缩放系数（96 DPI = 1.0）。
     pub scale: f32,
-    /// 叠加层用的字体数据。
-    pub font: Vec<u8>,
 }
 
 /// 平台后端：所有需要与操作系统交互的能力。
@@ -56,14 +57,36 @@ pub trait Backend {
     /// 进入提示模式之前的准备：记录要采集的前台窗口等。
     fn begin_hints(&mut self) {}
 
-    /// 在屏幕坐标处模拟一次左键单击。
-    fn click(&mut self, x: i32, y: i32);
+    /// 把鼠标移到屏幕坐标处（选中目标后定位）。
+    fn move_cursor(&mut self, x: i32, y: i32);
+
+    /// 相对移动鼠标（像素），用于选中后微调。
+    fn nudge_cursor(&mut self, dx: i32, dy: i32);
+
+    /// 在当前鼠标位置模拟左键：`double` 为真时双击，否则单击。
+    fn click(&mut self, double: bool);
+
+    /// 在当前鼠标位置模拟右键。
+    fn right_click(&mut self);
+
+    /// 点击后等待新 UI（菜单 / 对话框 / 新窗口）出现，最多 `timeout`。
+    fn wait_new_ui(&mut self, _timeout: std::time::Duration) -> bool {
+        false
+    }
+
+    /// 采集新出现 UI 的目标（链式扫描，不启用 OCR 兜底）。
+    fn collect_chained_targets(&mut self) -> Vec<Target> {
+        Vec::new()
+    }
 
     /// 模拟滚轮，单位为滚轮刻度（正值向下 / 向右）。
     fn scroll(&mut self, vertical: i32, horizontal: i32);
 
-    /// 把画布内容显示到叠加层上。
-    fn present(&mut self, canvas: &Canvas);
+    /// 测量一行文字的宽度（物理像素），用于标签与 HUD 的布局。
+    fn measure_text(&mut self, text: &str, px: f32) -> f32;
+
+    /// 把一帧绘制指令显示到叠加层上。
+    fn present(&mut self, scene: &Scene);
 
     /// 隐藏叠加层。
     fn hide(&mut self);

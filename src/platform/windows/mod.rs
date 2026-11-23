@@ -2,6 +2,7 @@
 
 mod hotkey;
 mod input;
+mod ocr;
 mod overlay;
 mod tray;
 mod uia;
@@ -10,17 +11,21 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use windows::core::{w, PCWSTR};
+use windows::core::{BOOL, PCWSTR, w};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, RECT, TRUE,
+    WPARAM,
 };
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::Threading::{
     CreateMutexW, GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
     SetProcessWorkingSetSize,
+};
+use windows::Win32::UI::Accessibility::{
+    HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -32,11 +37,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DefWindowProcW, DispatchMessageW, GetClassNameW, GetForegroundWindow,
-    GetMessageW, GetSystemMetrics, GetWindowThreadProcessId, KBDLLHOOKSTRUCT, KillTimer, MSG,
-    MB_ICONINFORMATION, MB_OK, MessageBoxW, PostMessageW, PostQuitMessage, SM_CXVIRTUALSCREEN,
+    CallNextHookEx, DefWindowProcW, DispatchMessageW, EnumWindows, EVENT_SYSTEM_DIALOGSTART,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPSTART, GetClassNameW, GetForegroundWindow,
+    GetGUIThreadInfo, GetMessageW, GetSystemMetrics, GetWindowRect, GetWindowThreadProcessId,
+    GUITHREADINFO,
+    HTTRANSPARENT, IsWindowVisible, KBDLLHOOKSTRUCT, KillTimer, MSG, MB_ICONINFORMATION, MB_OK,
+    MessageBoxW, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetTimer, SetWindowsHookExW,
-    TIMERPROC, TranslateMessage, WH_KEYBOARD_LL, WM_APP, WM_HOTKEY, WM_KEYDOWN, WM_SYSKEYDOWN,
+    TIMERPROC, TranslateMessage, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_HOTKEY, WM_KEYDOWN, WM_NCHITTEST, WM_QUIT, WM_SYSKEYDOWN,
     WM_TIMER,
 };
 
@@ -44,10 +53,10 @@ use self::hotkey::{HookHandle, HotkeySpec, Hotkeys};
 use self::overlay::Overlay;
 use self::uia::UiaSource;
 use crate::app::App;
-use crate::config::Config;
+use crate::config::{Config, OcrConfig};
 use crate::model::{Rect, Target};
 use crate::platform::{Backend, Desktop, Key};
-use crate::render::Canvas;
+use crate::render::Scene;
 
 const HOTKEY_HINT: i32 = 1;
 const HOTKEY_QUIT: i32 = 2;
@@ -62,6 +71,7 @@ const WM_VIMGLIDE_KEY: u32 = WM_APP + 1;
 pub(super) const WM_VIMGLIDE_TRAY: u32 = WM_APP + 2;
 const FLAG_SHIFT: isize = 1;
 const FLAG_TOGGLE: isize = 2;
+const FLAG_CTRL: isize = 4;
 
 /// 是否处于「键盘只交给 VimGlide」的状态。
 static CAPTURE: AtomicBool = AtomicBool::new(false);
@@ -71,6 +81,10 @@ static OVERLAY_HWND: AtomicIsize = AtomicIsize::new(0);
 static HINT_SPEC: Mutex<Option<HotkeySpec>> = Mutex::new(None);
 /// 退出热键，捕获期间需要放行给系统处理。
 static QUIT_SPEC: Mutex<Option<HotkeySpec>> = Mutex::new(None);
+/// 本次提示模式的采集根窗口，用于判断「是否换了新窗口」。
+static SCAN_ROOT: AtomicIsize = AtomicIsize::new(0);
+/// WinEvent 是否观察到了新 UI（菜单弹出 / 对话框 / 新前台窗口）。
+static NEW_UI: AtomicBool = AtomicBool::new(false);
 
 /// 消息循环中分发给 App 的运行时指针。
 ///
@@ -135,7 +149,14 @@ pub struct WindowsBackend {
     last_external: HWND,
     uia: Option<UiaSource>,
     uia_unavailable: bool,
+    /// UIA 结果不足时的 OCR 兜底配置。
+    ocr: OcrConfig,
+    /// 提示模式开始时目标进程的可见顶层窗口快照，用于找出点击后新出现的弹层。
+    windows_before: Vec<WindowSnapshot>,
 }
+
+/// 可见顶层窗口快照：句柄 + 屏幕矩形。
+type WindowSnapshot = (isize, i32, i32, i32, i32);
 
 /// 配置的热键被其它程序占用时，依次尝试这些备用热键。
 const HINT_HOTKEY_FALLBACKS: [&str; 2] = ["ctrl+alt+space", "alt+shift+space"];
@@ -204,6 +225,8 @@ impl WindowsBackend {
             last_external: HWND::default(),
             uia: None,
             uia_unavailable: false,
+            ocr: config.ocr.clone(),
+            windows_before: Vec::new(),
         })
     }
 
@@ -240,7 +263,7 @@ impl WindowsBackend {
         let config = match Config::from_path(&self.config_path) {
             Ok(config) => config,
             Err(e) => {
-                // 错误信息可能包含中文，遮罩字体不含中文字形，改用消息框显示。
+                // 解析错误信息可能较长，用消息框完整显示，避免被遮罩截断。
                 if let Some(tray) = &self.tray {
                     tray.show_error(&e);
                 } else {
@@ -266,7 +289,7 @@ impl WindowsBackend {
             app.show_message(
                 self,
                 format!(
-                    "VimGlide: hotkey `{}` unavailable, config not reloaded",
+                    "热键 `{}` 不可用，配置未重新载入",
                     config.hotkey.hint
                 ),
                 true,
@@ -292,6 +315,7 @@ impl WindowsBackend {
             }
         };
 
+        self.ocr = config.ocr.clone();
         self.hint_hotkey = hint_hotkey.clone();
         self.hint_spec = hint_spec;
         self.quit_hotkey = quit_hotkey.clone();
@@ -304,9 +328,40 @@ impl WindowsBackend {
         app.apply_config(self, config);
         app.show_message(
             self,
-            format!("VimGlide: config reloaded ({hint_hotkey})"),
+            format!("配置已重新载入 ({hint_hotkey})"),
             false,
         );
+    }
+
+    /// OCR 兜底：识别窗口文字行，过滤掉与已有目标重叠的行后追加。
+    fn append_ocr_targets(&self, targets: &mut Vec<Target>) {
+        let started = Instant::now();
+        match ocr::scan_window(self.scan_root) {
+            Ok(lines) => {
+                // 总数量同样受 max_targets 限制。
+                targets.truncate(self.ocr.max_targets);
+                let before = targets.len();
+                for line in lines {
+                    if targets.len() >= self.ocr.max_targets {
+                        break;
+                    }
+                    if overlaps_existing(targets, &line.rect) {
+                        continue;
+                    }
+                    targets.push(Target {
+                        rect: line.rect,
+                        name: line.text,
+                    });
+                }
+                eprintln!(
+                    "VimGlide: OCR 兜底识别补充了 {} 个目标（共 {} 个），耗时 {} ms",
+                    targets.len() - before,
+                    targets.len(),
+                    started.elapsed().as_millis()
+                );
+            }
+            Err(e) => eprintln!("VimGlide: OCR 兜底识别失败：{e}"),
+        }
     }
 
     fn message_loop(&mut self, app: &mut App) -> Result<(), String> {
@@ -352,9 +407,14 @@ impl Backend for WindowsBackend {
             foreground
         };
         self.scan_root = root;
+        SCAN_ROOT.store(root.0 as isize, Ordering::SeqCst);
         if !root.0.is_null() {
             self.last_external = root;
         }
+        // 记录当前可见顶层窗口，点击后对比即可发现 Chromium 之类的独立弹层。
+        self.windows_before = window_pid(root)
+            .map(snapshot_windows)
+            .unwrap_or_default();
         self.overlay.request_activation();
     }
 
@@ -371,7 +431,7 @@ impl Backend for WindowsBackend {
                 }
             }
         }
-        let targets = match &self.uia {
+        let mut targets = match &self.uia {
             Some(source) => source.collect(
                 self.desktop.screen,
                 Duration::from_millis(1500),
@@ -380,24 +440,133 @@ impl Backend for WindowsBackend {
             None => Vec::new(),
         };
         self.needs_admin = targets.is_empty() && elevated_target && !self.elevated;
+        // 扫描结束后不再需要 UIA：释放 COM 树，显示提示期间只保留坐标。
+        self.uia = None;
+
+        // UIA 几乎采不到元素时（Chromium 未开启无障碍树等），用系统 OCR 兜底。
+        if self.ocr.enabled
+            && targets.len() < self.ocr.min_uia_targets
+            && !self.scan_root.0.is_null()
+        {
+            self.append_ocr_targets(&mut targets);
+        }
         targets
     }
 
-    fn click(&mut self, x: i32, y: i32) {
-        // 桌面图标需要双击才会执行；普通窗口的按钮单击即可。
-        if is_desktop_window(self.scan_root) {
-            input::double_click(x, y);
+    fn move_cursor(&mut self, x: i32, y: i32) {
+        input::move_to(x, y);
+    }
+
+    fn nudge_cursor(&mut self, dx: i32, dy: i32) {
+        input::nudge(dx, dy);
+    }
+
+    fn click(&mut self, double: bool) {
+        if double {
+            input::double_click_here();
         } else {
-            input::click(x, y);
+            input::click_here();
         }
+    }
+
+    fn right_click(&mut self) {
+        input::right_click_here();
+    }
+
+    fn wait_new_ui(&mut self, timeout: Duration) -> bool {
+        NEW_UI.store(false, Ordering::SeqCst);
+        // SAFETY: 钩子仅在本次等待期间安装，回调只写原子标志。
+        let foreground_hook = unsafe {
+            SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_MENUPOPUPSTART,
+                None,
+                Some(new_ui_proc),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+        let dialog_hook = unsafe {
+            SetWinEventHook(
+                EVENT_SYSTEM_DIALOGSTART,
+                EVENT_SYSTEM_DIALOGSTART,
+                None,
+                Some(new_ui_proc),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+
+        let deadline = Instant::now() + timeout;
+        let mut found = false;
+        // 菜单可能已经弹出，先轮询一次，再等 WinEvent 或轮询兜底。
+        while Instant::now() < deadline {
+            pump_messages();
+            if NEW_UI.load(Ordering::SeqCst)
+                || new_ui_present(self.scan_root, self.overlay.hwnd(), &self.windows_before)
+            {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // SAFETY: 句柄由上面的调用返回。
+        unsafe {
+            if !foreground_hook.is_invalid() {
+                let _ = UnhookWinEvent(foreground_hook);
+            }
+            if !dialog_hook.is_invalid() {
+                let _ = UnhookWinEvent(dialog_hook);
+            }
+        }
+        found
+    }
+
+    fn collect_chained_targets(&mut self) -> Vec<Target> {
+        if self.uia.is_none() && !self.uia_unavailable {
+            match UiaSource::new() {
+                Ok(source) => self.uia = Some(source),
+                Err(e) => {
+                    eprintln!("VimGlide: {e}");
+                    self.uia_unavailable = true;
+                }
+            }
+        }
+        let Some(source) = &self.uia else {
+            return Vec::new();
+        };
+        // 只采集新出现的 UI：弹层、菜单、对话框或新的前台窗口。
+        let roots = chained_roots(self.scan_root, self.overlay.hwnd(), &self.windows_before);
+        let mut targets = Vec::new();
+        for root in roots.iter().take(3) {
+            let mut batch = source.collect(
+                self.desktop.screen,
+                Duration::from_millis(400),
+                *root,
+            );
+            // Chromium 等自绘弹层在未开启无障碍树时 UIA 采不到，对这一小块弹层做 OCR 兜底。
+            if batch.is_empty() && self.ocr.enabled {
+                batch = ocr_targets(*root, self.ocr.max_targets);
+            }
+            targets.extend(batch);
+        }
+        self.uia = None;
+        dedupe_targets(targets)
     }
 
     fn scroll(&mut self, vertical: i32, horizontal: i32) {
         input::wheel(vertical, horizontal);
     }
 
-    fn present(&mut self, canvas: &Canvas) {
-        if let Err(e) = self.overlay.present(canvas) {
+    fn measure_text(&mut self, text: &str, px: f32) -> f32 {
+        self.overlay.measure_text(text, px)
+    }
+
+    fn present(&mut self, scene: &Scene) {
+        if let Err(e) = self.overlay.present(scene) {
             eprintln!("VimGlide: {e}");
         }
     }
@@ -459,12 +628,21 @@ pub(super) unsafe extern "system" fn wnd_proc(
             if flags & FLAG_TOGGLE != 0 {
                 with_runtime(|app, backend| app.toggle(backend));
             } else {
-                let key = map_key(vk, flags & FLAG_SHIFT != 0);
+                let key = map_key(vk, flags & FLAG_SHIFT != 0, flags & FLAG_CTRL != 0);
                 with_runtime(|app, backend| {
                     app.on_key(backend, key);
                 });
             }
             LRESULT(0)
+        }
+        WM_NCHITTEST => {
+            // 遮罩只用于显示：命中测试返回透明，鼠标事件落到下面的窗口。
+            if OVERLAY_HWND.load(Ordering::SeqCst) == hwnd.0 as isize {
+                LRESULT(HTTRANSPARENT as isize)
+            } else {
+                // SAFETY: 交给系统默认处理。
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            }
         }
         WM_VIMGLIDE_TRAY => {
             with_runtime(|app, backend| {
@@ -579,7 +757,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         return passthrough(code);
     }
 
-    let flags = if shift { FLAG_SHIFT } else { 0 };
+    let flags = (if shift { FLAG_SHIFT } else { 0 }) | (if ctrl { FLAG_CTRL } else { 0 });
     post_key(hwnd, kb.vkCode, flags);
     LRESULT(1)
 }
@@ -610,14 +788,14 @@ fn key_down(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> boo
 }
 
 /// 虚拟键码 -> 平台无关按键。
-fn map_key(vk: u32, shift: bool) -> Key {
+fn map_key(vk: u32, shift: bool, ctrl: bool) -> Key {
     match vk {
         0x41..=0x5A => {
             let base = (b'a' + (vk - 0x41) as u8) as char;
             Key::Char(if shift { base.to_ascii_uppercase() } else { base })
         }
         0x30..=0x39 => Key::Char((b'0' + (vk - 0x30) as u8) as char),
-        vk if vk == VK_SPACE.0 as u32 => Key::Char(' '),
+        vk if vk == VK_SPACE.0 as u32 => Key::Space { shift, ctrl },
         vk if vk == VK_BACK.0 as u32 => Key::Backspace,
         vk if vk == VK_ESCAPE.0 as u32 => Key::Escape,
         vk if vk == VK_RETURN.0 as u32 => Key::Enter,
@@ -663,13 +841,10 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), String
     if screen.is_empty() {
         return Err("无法获取屏幕尺寸".to_string());
     }
-    let font = load_ui_font()
-        .ok_or_else(|| "未找到可用的系统字体（尝试过 Segoe UI / Arial）".to_string())?;
     let overlay = Overlay::new(screen)?;
     let desktop = Desktop {
         screen,
         scale: overlay.dpi_scale(),
-        font,
     };
     let mut backend = WindowsBackend::new(&config, &config_path, desktop, overlay)?;
     let mut app = App::new(config.clone(), backend.desktop())?;
@@ -679,7 +854,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), String
         backend.hint_hotkey, config.hotkey.quit
     );
     // 发行版没有控制台，用一个短暂的浮层提示「已在运行」和生效的热键。
-    let ready = format!("VimGlide ready   {}", backend.hint_hotkey);
+    let ready = format!("已就绪   {}", backend.hint_hotkey);
     app.show_toast(&mut backend, ready);
     backend.run(&mut app)
 }
@@ -755,16 +930,285 @@ fn window_pid(hwnd: HWND) -> Option<u32> {
     }
 }
 
-/// 窗口是否属于桌面（桌面图标需要双击才能打开）。
-fn is_desktop_window(hwnd: HWND) -> bool {
+/// OCR 行是否与已有目标重复：覆盖了目标面积的一半，或中心点落在目标内。
+fn overlaps_existing(targets: &[Target], rect: &Rect) -> bool {
+    let (cx, cy) = rect.center();
+    targets.iter().any(|target| {
+        let overlap = target
+            .rect
+            .intersection(rect)
+            .map(|shared| shared.area())
+            .unwrap_or(0);
+        let center_inside = cx >= target.rect.x
+            && cx < target.rect.right()
+            && cy >= target.rect.y
+            && cy < target.rect.bottom();
+        overlap * 2 > target.rect.area() || center_inside
+    })
+}
+
+/// WinEvent 回调：只关心菜单弹出、对话框开始和新前台窗口。
+unsafe extern "system" fn new_ui_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _id_thread: u32,
+    _time: u32,
+) {
     if hwnd.0.is_null() {
+        return;
+    }
+    if hwnd.0 as isize == OVERLAY_HWND.load(Ordering::SeqCst) {
+        return;
+    }
+    match event {
+        EVENT_SYSTEM_MENUPOPUPSTART | EVENT_SYSTEM_DIALOGSTART => {
+            NEW_UI.store(true, Ordering::SeqCst);
+        }
+        EVENT_SYSTEM_FOREGROUND => {
+            // 只有换成另一个顶层窗口才算新 UI。
+            if hwnd.0 as isize != SCAN_ROOT.load(Ordering::SeqCst) {
+                NEW_UI.store(true, Ordering::SeqCst);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 轮询兜底：是否存在菜单、对话框、新前台窗口，或同进程新出现的弹层。
+fn new_ui_present(scan_root: HWND, overlay: HWND, before: &[WindowSnapshot]) -> bool {
+    // SAFETY: 纯查询调用。
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.0.is_null() || foreground == overlay {
         return false;
     }
+    if foreground != scan_root {
+        return true;
+    }
+    // 菜单不一定改变前台窗口，再检查菜单归属与菜单类窗口。
+    if menu_owner(foreground).is_some() || !visible_menus(foreground).is_empty() {
+        return true;
+    }
+    // Chromium / XAML 的弹层是独立窗口，不改变前台，也不会出现在菜单类名里。
+    window_pid(scan_root)
+        .map(|pid| !new_popup_windows(pid, before).is_empty())
+        .unwrap_or(false)
+}
+
+/// 前台线程是否拥有活动菜单，返回菜单所有者窗口。
+fn menu_owner(hwnd: HWND) -> Option<HWND> {
+    if hwnd.0.is_null() {
+        return None;
+    }
+    // SAFETY: 纯查询调用。
+    let thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    if thread == 0 {
+        return None;
+    }
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: cbSize 已按结构体大小填写。
+    unsafe { GetGUIThreadInfo(thread, &mut info).ok()? };
+    if info.hwndMenuOwner.0.is_null() {
+        None
+    } else {
+        Some(info.hwndMenuOwner)
+    }
+}
+
+/// Win32 菜单弹窗的类名。
+const MENU_CLASS: &str = "#32768";
+
+struct MenuSearch {
+    thread: u32,
+    out: Vec<HWND>,
+}
+
+/// 枚举指定线程当前可见的菜单弹窗。
+fn visible_menus(owner: HWND) -> Vec<HWND> {
+    // SAFETY: 纯查询调用。
+    let thread = unsafe { GetWindowThreadProcessId(owner, None) };
+    if thread == 0 {
+        return Vec::new();
+    }
+    let mut search = MenuSearch {
+        thread,
+        out: Vec::new(),
+    };
+    // SAFETY: 回调只在本调用期间通过 lparam 访问 search。
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_menu_proc),
+            LPARAM(&mut search as *mut MenuSearch as isize),
+        );
+    }
+    search.out
+}
+
+unsafe extern "system" fn enum_menu_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = unsafe { &mut *(lparam.0 as *mut MenuSearch) };
+    if unsafe { GetWindowThreadProcessId(hwnd, None) } != search.thread {
+        return TRUE;
+    }
+    if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return TRUE;
+    }
     let mut buffer = [0u16; 64];
-    // SAFETY: 传入的缓冲区长度与切片长度一致。
     let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
-    let class = String::from_utf16_lossy(&buffer[..len.max(0) as usize]);
-    matches!(class.as_str(), "Progman" | "WorkerW" | "SHELLDLL_DefView")
+    if len > 0 && String::from_utf16_lossy(&buffer[..len as usize]) == MENU_CLASS {
+        search.out.push(hwnd);
+    }
+    TRUE
+}
+
+/// 链式扫描的根窗口：同进程新弹层优先，其次是菜单和新前台窗口。
+fn chained_roots(scan_root: HWND, overlay: HWND, before: &[WindowSnapshot]) -> Vec<HWND> {
+    // SAFETY: 纯查询调用。
+    let foreground = unsafe { GetForegroundWindow() };
+    let mut roots: Vec<HWND> = Vec::new();
+    // Chromium 下拉、XAML 菜单等独立弹层不改变前台窗口，靠窗口快照对比发现。
+    if let Some(pid) = window_pid(scan_root) {
+        roots.extend(new_popup_windows(pid, before));
+    }
+    if !foreground.0.is_null() && foreground != overlay {
+        roots.extend(visible_menus(foreground));
+        if foreground != scan_root {
+            roots.push(foreground);
+        }
+    }
+    if roots.is_empty() && !scan_root.0.is_null() {
+        roots.push(scan_root);
+    }
+    let mut unique: Vec<HWND> = Vec::new();
+    for root in roots {
+        if !unique.contains(&root) {
+            unique.push(root);
+        }
+    }
+    unique
+}
+
+struct WindowSearch {
+    pid: u32,
+    out: Vec<WindowSnapshot>,
+}
+
+/// 快照目标进程所有可见顶层窗口（排除工具提示）。
+fn snapshot_windows(pid: u32) -> Vec<WindowSnapshot> {
+    let mut search = WindowSearch {
+        pid,
+        out: Vec::new(),
+    };
+    // SAFETY: 回调只在本调用期间通过 lparam 访问 search。
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_window_proc),
+            LPARAM(&mut search as *mut WindowSearch as isize),
+        );
+    }
+    search.out
+}
+
+/// 当前可见但快照里没有的窗口，即点击后新出现的弹层。
+fn new_popup_windows(pid: u32, before: &[WindowSnapshot]) -> Vec<HWND> {
+    snapshot_windows(pid)
+        .into_iter()
+        .filter(|(hwnd, ..)| !before.iter().any(|(old, ..)| old == hwnd))
+        .map(|(hwnd, ..)| HWND(hwnd as *mut _))
+        .collect()
+}
+
+unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let search = unsafe { &mut *(lparam.0 as *mut WindowSearch) };
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid != search.pid || !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return TRUE;
+    }
+    if window_class(hwnd) == "tooltips_class32" {
+        return TRUE;
+    }
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+        return TRUE;
+    }
+    let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+    if width <= 0 || height <= 0 {
+        return TRUE;
+    }
+    search
+        .out
+        .push((hwnd.0 as isize, rect.left, rect.top, width, height));
+    TRUE
+}
+
+/// 读取窗口类名。
+fn window_class(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 64];
+    // SAFETY: 纯查询调用。
+    let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
+    if len == 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&buffer[..len as usize])
+    }
+}
+
+/// 对单个窗口做 OCR，把文字行转成目标。
+fn ocr_targets(hwnd: HWND, limit: usize) -> Vec<Target> {
+    let Ok(lines) = ocr::scan_window(hwnd) else {
+        return Vec::new();
+    };
+    let mut targets: Vec<Target> = Vec::new();
+    for line in lines {
+        if targets.len() >= limit {
+            break;
+        }
+        if overlaps_existing(&targets, &line.rect) {
+            continue;
+        }
+        targets.push(Target {
+            rect: line.rect,
+            name: line.text,
+        });
+    }
+    targets
+}
+
+/// 按矩形去重，避免多个根窗口采到同一控件。
+fn dedupe_targets(targets: Vec<Target>) -> Vec<Target> {
+    let mut seen = std::collections::HashSet::new();
+    targets
+        .into_iter()
+        .filter(|target| {
+            seen.insert((
+                target.rect.x,
+                target.rect.y,
+                target.rect.w,
+                target.rect.h,
+            ))
+        })
+        .collect()
+}
+
+/// 等待新 UI 期间抽取消息，保证 WinEvent 回调能被派发。
+fn pump_messages() {
+    // SAFETY: 消息循环由本线程拥有，这里只是非阻塞地抽取并分发。
+    unsafe {
+        let mut message = MSG::default();
+        while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+            if message.message == WM_QUIT {
+                PostQuitMessage(0);
+                return;
+            }
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
 }
 
 /// 只允许运行一个实例，避免出现两个托盘图标互相抢热键。
@@ -818,19 +1262,6 @@ fn virtual_screen() -> Rect {
             GetSystemMetrics(SM_CYVIRTUALSCREEN),
         )
     }
-}
-
-fn load_ui_font() -> Option<Vec<u8>> {
-    let windows_dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
-    for name in ["segoeuisb.ttf", "segoeui.ttf", "arialbd.ttf", "arial.ttf", "tahoma.ttf"] {
-        let path = Path::new(&windows_dir).join("Fonts").join(name);
-        if let Ok(bytes) = std::fs::read(&path) {
-            if fontdue::Font::from_bytes(bytes.clone(), fontdue::FontSettings::default()).is_ok() {
-                return Some(bytes);
-            }
-        }
-    }
-    None
 }
 
 /// 无控制台的发行版里用系统消息框展示致命错误。

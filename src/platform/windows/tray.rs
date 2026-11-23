@@ -373,9 +373,10 @@ fn load_symbol_font() -> Option<Vec<u8>> {
 }
 
 /// 画一个 32x32 的托盘图标：黄色圆角方块 + 键盘符号 ⌨（U+2328）。
-fn icon_canvas() -> Canvas {
+fn icon_pixels() -> Vec<u8> {
     const SIZE: i32 = 32;
-    let mut canvas = Canvas::new(SIZE as u32, SIZE as u32);
+    let mut pixels = vec![0u8; (SIZE * SIZE * 4) as usize];
+    let mut canvas = Canvas::new(&mut pixels, SIZE as u32, SIZE as u32);
     canvas.fill_round_rect(
         Rect::new(1, 1, SIZE - 2, SIZE - 2),
         7.0,
@@ -412,13 +413,13 @@ fn icon_canvas() -> Canvas {
         }
         canvas.fill_round_rect(Rect::new(11, 20, 10, 2), 1.0, dark);
     }
-    canvas
+    pixels
 }
 
 /// 把画布转成托盘图标句柄。
 fn create_icon() -> Option<HICON> {
     const SIZE: i32 = 32;
-    let canvas = icon_canvas();
+    let pixels = icon_pixels();
 
     // SAFETY: 位图与图标句柄都在本函数内创建，复制后立即释放临时位图。
     unsafe {
@@ -438,7 +439,7 @@ fn create_icon() -> Option<HICON> {
         let mut bits: *mut std::ffi::c_void = ptr::null_mut();
         let dib = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
         let dst = std::slice::from_raw_parts_mut(bits as *mut u8, (SIZE * SIZE * 4) as usize);
-        for (source, target) in canvas.data().chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+        for (source, target) in pixels.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
             target[0] = source[2];
             target[1] = source[1];
             target[2] = source[0];

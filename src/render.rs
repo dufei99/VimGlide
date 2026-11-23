@@ -1,7 +1,7 @@
-//! 极简软件渲染器：在 RGBA 缓冲区上绘制圆角矩形与文字。
+//! 颜色、遮罩绘制指令与极简软件渲染器。
 //!
-//! 输出的像素为「直通 alpha」的 RGBA，由平台层负责转换成
-//! Windows 分层窗口所需的预乘 BGRA。
+//! 遮罩层由平台后端用 Direct2D 直接绘制 [`Scene`]；这里的 [`Canvas`]
+//! 只用于需要 CPU 位图的场景（例如 32x32 的托盘图标）。
 
 use fontdue::{Font, FontSettings};
 
@@ -46,50 +46,108 @@ impl Color {
     }
 }
 
-/// 一块 RGBA8 画布。
-pub struct Canvas {
-    width: u32,
-    height: u32,
-    pixels: Vec<u8>,
+/// 一段文字（同一行内的一个着色片段）。
+pub struct TextRun {
+    pub text: String,
+    pub color: Color,
+    /// 描边色；`None` 表示不描边。
+    pub halo: Option<Color>,
 }
 
-impl Canvas {
+/// 一段在给定矩形内垂直居中的文字。
+///
+/// 坐标与尺寸都是物理像素（DPI 缩放由调用方预先算进字号）。
+pub struct TextBlock {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub px: f32,
+    pub runs: Vec<TextRun>,
+}
+
+/// 一条绘制指令。`App` 只负责布局，交给平台后端光栅化。
+pub enum Op {
+    FillRoundRect {
+        rect: Rect,
+        radius: f32,
+        color: Color,
+    },
+    StrokeRoundRect {
+        rect: Rect,
+        radius: f32,
+        thickness: f32,
+        color: Color,
+    },
+    Text(TextBlock),
+}
+
+/// 一帧的绘制指令列表。
+///
+/// 尺寸与窗口的物理像素一致；后端不需要额外的整屏 CPU 缓冲区。
+pub struct Scene {
+    pub width: u32,
+    pub height: u32,
+    ops: Vec<Op>,
+}
+
+impl Scene {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             width,
             height,
-            pixels: vec![0; width as usize * height as usize * 4],
+            ops: Vec::new(),
         }
     }
 
-    pub fn width(&self) -> u32 {
-        self.width
+    pub fn ops(&self) -> &[Op] {
+        &self.ops
     }
 
-    pub fn height(&self) -> u32 {
-        self.height
+    pub fn fill_round_rect(&mut self, rect: Rect, radius: f32, color: Color) {
+        self.ops.push(Op::FillRoundRect {
+            rect,
+            radius,
+            color,
+        });
     }
 
-    pub fn data(&self) -> &[u8] {
-        &self.pixels
+    pub fn stroke_round_rect(
+        &mut self,
+        rect: Rect,
+        radius: f32,
+        thickness: f32,
+        color: Color,
+    ) {
+        self.ops.push(Op::StrokeRoundRect {
+            rect,
+            radius,
+            thickness,
+            color,
+        });
     }
 
-    /// 释放像素缓冲，降低隐藏期间的常驻内存。
-    pub fn release(&mut self) {
-        self.pixels = Vec::new();
-        self.width = 0;
-        self.height = 0;
+    pub fn text(&mut self, block: TextBlock) {
+        self.ops.push(Op::Text(block));
     }
+}
 
-    /// 确保画布尺寸正确；尺寸变化或已释放时重新分配。
-    pub fn ensure_size(&mut self, width: u32, height: u32) {
-        if self.width != width || self.height != height {
-            *self = Self::new(width, height);
+/// 一块 RGBA8 画布，直接借用平台提供的像素缓冲，避免额外的整屏拷贝。
+pub struct Canvas<'a> {
+    width: u32,
+    height: u32,
+    pixels: &'a mut [u8],
+}
+
+impl<'a> Canvas<'a> {
+    /// `pixels` 长度需为 `width * height * 4`。
+    pub fn new(pixels: &'a mut [u8], width: u32, height: u32) -> Self {
+        debug_assert_eq!(pixels.len(), width as usize * height as usize * 4);
+        Self {
+            width,
+            height,
+            pixels,
         }
-    }
-
-    pub fn clear(&mut self) {
-        self.pixels.fill(0);
     }
 
     fn blend(&mut self, x: i32, y: i32, color: Color, coverage: f32) {
@@ -171,13 +229,6 @@ impl TextRenderer {
         Some(Self { font })
     }
 
-    pub fn ascent(&self, px: f32) -> f32 {
-        self.font
-            .horizontal_line_metrics(px)
-            .map(|m| m.ascent)
-            .unwrap_or(px * 0.8)
-    }
-
     pub fn measure(&self, text: &str, px: f32) -> f32 {
         text.chars()
             .map(|c| self.font.metrics(c, px).advance_width)
@@ -196,7 +247,7 @@ impl TextRenderer {
     }
 
     /// 以基线为基准绘制文本。
-    pub fn draw(&self, canvas: &mut Canvas, text: &str, x: f32, baseline: f32, px: f32, color: Color) {
+    pub fn draw(&self, canvas: &mut Canvas<'_>, text: &str, x: f32, baseline: f32, px: f32, color: Color) {
         let mut pen = x;
         for c in text.chars() {
             let (metrics, bitmap) = self.font.rasterize(c, px);
@@ -216,34 +267,4 @@ impl TextRenderer {
         }
     }
 
-    /// 带描边的文本：先在四周偏移处画一圈 `halo` 色，再画正文，
-    /// 这样标签底色可以做成半透明而不影响可读性。
-    pub fn draw_outlined(
-        &self,
-        canvas: &mut Canvas,
-        text: &str,
-        x: f32,
-        baseline: f32,
-        px: f32,
-        color: Color,
-        halo: Color,
-    ) {
-        let radius = (px / 14.0).round().clamp(1.0, 2.0) as i32;
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                if dx == 0 && dy == 0 {
-                    continue;
-                }
-                self.draw(
-                    canvas,
-                    text,
-                    x + dx as f32,
-                    baseline + dy as f32,
-                    px,
-                    halo,
-                );
-            }
-        }
-        self.draw(canvas, text, x, baseline, px, color);
-    }
 }
